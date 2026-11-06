@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Black-Werx
+Comment=Blackwork embroidery pattern editor
+Exec=blackwerx
+Icon=blackwerx
+Categories=Graphics;Office;
+Terminal=false
