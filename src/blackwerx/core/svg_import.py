@@ -192,10 +192,9 @@ def import_svg(svg_path: str, width: int, height: int, *,
         stitches = outline_stitches(covered, default_color)
 
     if map_to_dmc:
-        stitches = [
-            Stitch(s.kind, s.a, s.b, palette.nearest_dmc(s.color))
-            for s in stitches
-        ]
+        from dataclasses import replace
+        stitches = [replace(s, color=palette.nearest_dmc(s.color))
+                    for s in stitches]
 
     return SvgImportResult(stitches=stitches, width=width, height=height,
                            cell_count=len(covered))

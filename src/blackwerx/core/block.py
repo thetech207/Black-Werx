@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
-from .model import Stitch, StitchKind, Transform
+from .model import Stitch, StitchKind, Transform, transform_stitch
 
 
 @dataclass
@@ -25,11 +25,9 @@ class Block:
         """(minx, miny, maxx, maxy) over all resolved content, or None."""
         xs, ys = [], []
         for s in self.stitches:
-            xs.append(s.a[0])
-            ys.append(s.a[1])
-            if s.b:
-                xs.append(s.b[0])
-                ys.append(s.b[1])
+            for px, py in s.extent_points():
+                xs.append(px)
+                ys.append(py)
         for inst in self.instances:
             sub = inst.resolved_bbox()
             if sub:
@@ -61,7 +59,7 @@ class Block:
             child_stitches = blk.resolved_stitches(child_t, registry=registry)
             if inst.recolor:
                 child_stitches = [
-                    Stitch(s.kind, s.a, s.b, inst.recolor.get(s.color, s.color))
+                    replace(s, color=inst.recolor.get(s.color, s.color))
                     for s in child_stitches
                 ]
             out.extend(child_stitches)
@@ -102,6 +100,7 @@ class BlockInstance:
     transform: Transform = field(default_factory=Transform.translation)
     linked: bool = True
     recolor: dict = field(default_factory=dict)  # {src_color: dst_color}
+    layer: str | None = None      # layer override; None keeps inner layers
     _block_cache: Block | None = field(default=None, repr=False, compare=False)
 
     # -- resolution ---------------------------------------------------
@@ -117,10 +116,10 @@ class BlockInstance:
             registry.update(pattern_blocks)
         out = block.resolved_stitches(self.transform, registry=registry)
         if self.recolor:
-            out = [
-                Stitch(s.kind, s.a, s.b, self.recolor.get(s.color, s.color))
-                for s in out
-            ]
+            out = [replace(s, color=self.recolor.get(s.color, s.color))
+                   for s in out]
+        if self.layer:
+            out = [replace(s, layer=self.layer) for s in out]
         return out
 
     def resolved_bbox(self, pattern_blocks=None, library_blocks=None):
@@ -129,8 +128,9 @@ class BlockInstance:
             return None
         xs, ys = [], []
         for s in stitches:
-            for p in ([s.a] + ([s.b] if s.b else [])):
-                xs.append(p[0]); ys.append(p[1])
+            for px, py in s.extent_points():
+                xs.append(px)
+                ys.append(py)
         return min(xs), min(ys), max(xs), max(ys)
 
     def _find_block(self, pattern_blocks, library_blocks) -> Block | None:
@@ -191,6 +191,7 @@ class BlockInstance:
             "transform": self.transform.to_dict(),
             "linked": self.linked,
             "recolor": self.recolor,
+            "layer": self.layer,
         }
 
     @staticmethod
@@ -202,6 +203,7 @@ class BlockInstance:
             transform=Transform.from_dict(d["transform"]),
             linked=d.get("linked", True),
             recolor=d.get("recolor", {}),
+            layer=d.get("layer"),
         )
 
     @staticmethod
@@ -211,9 +213,7 @@ class BlockInstance:
 
 
 def _transform_stitch(s: Stitch, t: Transform) -> Stitch:
-    a = t.apply(s.a)
-    b = t.apply(s.b) if s.b else None
-    return Stitch(s.kind, a, b, s.color)
+    return transform_stitch(s, t)
 
 
 def explode_instance(inst: BlockInstance, pattern, mode: str,

@@ -20,7 +20,7 @@ class TestStitch:
     def test_x_stitch(self):
         s = X(3, 4)
         assert s.kind is StitchKind.X
-        assert s.key == ("x", (3, 4), None)
+        assert s.key == ("x", (3, 4), None, "layer1", 0.0, 1.0)
 
     def test_backstitch_normalizes_endpoints(self):
         s = B((5, 5), (3, 3))
@@ -120,7 +120,8 @@ class TestBlock:
                              transform=Transform.from_semantic(0, 0, 90))
         out = inst.resolve({"b2": b}, {})
         pts = sorted(s.a for s in out)
-        assert pts == [(0, 0), (0, 1)]  # (1,0) rotated 90 -> (0,1)
+        # cells (0,0),(1,0) span [0,2]x[0,1]; rot90 CCW -> [-1,0]x[0,2]
+        assert pts == [(-1, 0), (-1, 1)]
 
     def test_nested_block(self):
         inner = Block(id="inner", name="dot")

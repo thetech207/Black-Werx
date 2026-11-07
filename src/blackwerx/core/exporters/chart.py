@@ -8,8 +8,21 @@ from dataclasses import dataclass
 from ..model import Stitch, StitchKind, Pattern
 from .. import palette
 
-# glyphs used for symbol charts, cycled per color
-SYMBOLS = list("•▲■◆★⬟⬢✚✖◇▣▤▥▦▧▨▩▭▮▯")
+# glyph sets used for symbol charts, cycled per color
+SYMBOL_SETS = {
+    "shapes": list("•▲■◆★⬟⬢✚✖◇▣▤▥▦▧▨▩▭▮▯"),
+    "letters": list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+    "numbers": [str(i) for i in range(1, 37)],
+}
+SYMBOL_STYLES = ["shapes", "letters", "numbers", "dmc"]
+
+
+def _dmc_symbol(spec: str) -> str:
+    """DMC number for a color spec (nearest match for custom hex)."""
+    from .. import palette
+    if spec.startswith("dmc:"):
+        return spec[4:]
+    return palette.nearest_dmc(spec)[4:]
 
 
 @dataclass
@@ -29,16 +42,21 @@ def collect_stitches(pattern: Pattern,
     return out
 
 
-def assign_symbols(stitches: list[Stitch]) -> dict[str, str]:
+def assign_symbols(stitches: list[Stitch],
+                   style: str = "shapes") -> dict[str, str]:
     """Map each distinct color spec to a chart symbol."""
     colors = sorted({s.color for s in stitches})
-    return {c: SYMBOLS[i % len(SYMBOLS)] for i, c in enumerate(colors)}
+    if style == "dmc":
+        return {c: _dmc_symbol(c) for c in colors}
+    table = SYMBOL_SETS.get(style, SYMBOL_SETS["shapes"])
+    return {c: table[i % len(table)] for i, c in enumerate(colors)}
 
 
 def build_chart(pattern: Pattern,
-                library_blocks: dict | None = None) -> list[ChartItem]:
+                library_blocks: dict | None = None,
+                symbol_style: str = "shapes") -> list[ChartItem]:
     stitches = collect_stitches(pattern, library_blocks)
-    syms = assign_symbols(stitches)
+    syms = assign_symbols(stitches, symbol_style)
     return [
         ChartItem(s, syms[s.color], s.color, palette.resolve(s.color))
         for s in stitches
@@ -46,12 +64,20 @@ def build_chart(pattern: Pattern,
 
 
 def pattern_bounds(pattern: Pattern,
-                   library_blocks: dict | None = None) -> tuple[int, int, int, int]:
-    xs, ys = [0, pattern.width - 1], [0, pattern.height - 1]
+                   library_blocks: dict | None = None,
+                   full_canvas: bool = False) -> tuple[int, int, int, int]:
+    """Bounds around stitch extents, or the whole canvas if full_canvas."""
+    if full_canvas:
+        return (0, 0, pattern.width - 1, pattern.height - 1)
+    xs, ys = [], []
     for s in collect_stitches(pattern, library_blocks):
-        for p in ([s.a] + ([s.b] if s.b else [])):
-            xs.append(p[0]); ys.append(p[1])
-    return min(xs), min(ys), max(xs), max(ys)
+        for px, py in s.extent_points():
+            xs.append(px); ys.append(py)
+    if not xs:
+        return (0, 0, pattern.width - 1, pattern.height - 1)
+    import math
+    return (math.floor(min(xs)), math.floor(min(ys)),
+            math.ceil(max(xs)), math.ceil(max(ys)))
 
 
 def draw_chart(painter, items: list[ChartItem], cell: float,
@@ -69,8 +95,8 @@ def draw_chart(painter, items: list[ChartItem], cell: float,
     if bounds is None:
         xs = [0]; ys = [0]
         for it in items:
-            for p in ([it.stitch.a] + ([it.stitch.b] if it.stitch.b else [])):
-                xs.append(p[0]); ys.append(p[1])
+            for px, py in it.stitch.extent_points():
+                xs.append(px); ys.append(py)
         bounds = (min(xs), min(ys), max(xs), max(ys))
     minx, miny, maxx, maxy = bounds
 
@@ -106,8 +132,8 @@ def draw_chart(painter, items: list[ChartItem], cell: float,
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
         if s.kind is StitchKind.X:
-            c = X(s.a)
-            half = cell * 0.42
+            c = X((s.a[0] + 0.5, s.a[1] + 0.5))
+            half = cell * 0.5
             path = QPainterPath()
             path.moveTo(c.x() - half, c.y() - half)
             path.lineTo(c.x() + half, c.y() + half)
@@ -115,7 +141,8 @@ def draw_chart(painter, items: list[ChartItem], cell: float,
             path.lineTo(c.x() - half, c.y() + half)
             painter.drawPath(path)
         else:
-            painter.drawLine(X(s.a), X(s.b))
+            pa, pb = s.endpoints()
+            painter.drawLine(X(pa), X(pb))
 
 
 def draw_symbol_chart(painter, items: list[ChartItem], cell: float,
@@ -127,8 +154,8 @@ def draw_symbol_chart(painter, items: list[ChartItem], cell: float,
     if bounds is None:
         xs = [0]; ys = [0]
         for it in items:
-            for p in ([it.stitch.a] + ([it.stitch.b] if it.stitch.b else [])):
-                xs.append(p[0]); ys.append(p[1])
+            for px, py in it.stitch.extent_points():
+                xs.append(px); ys.append(py)
         bounds = (min(xs), min(ys), max(xs), max(ys))
     minx, miny, maxx, maxy = bounds
 
@@ -160,13 +187,14 @@ def draw_symbol_chart(painter, items: list[ChartItem], cell: float,
         s = it.stitch
         painter.setPen(QPen(QColor(it.hex_color), 1))
         if s.kind is StitchKind.X:
-            c = X(s.a)
+            c = X((s.a[0] + 0.5, s.a[1] + 0.5))
             painter.drawText(int(c.x() - cell / 2), int(c.y() + cell / 3),
                              it.symbol)
         else:
             # symbol chart convention: show line stitches with their glyph
             # placed at midpoint
-            mid = ((s.a[0] + s.b[0]) / 2, (s.a[1] + s.b[1]) / 2)
+            pa, pb = s.endpoints()
+            mid = ((pa[0] + pb[0]) / 2, (pa[1] + pb[1]) / 2)
             c = X((round(mid[0]), round(mid[1])))
             painter.drawText(int(c.x() - cell / 2), int(c.y() + cell / 3),
                              it.symbol)

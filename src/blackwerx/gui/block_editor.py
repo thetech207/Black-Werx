@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                                QLabel, QDialogButtonBox)
@@ -42,10 +44,10 @@ class BlockEditorDialog(QDialog):
         # load block content translated into scratch space
         # copy raw stitches translated (preserving nested instances below)
         for s in block.stitches:
-            self.pattern.add_stitch(Stitch(
-                s.kind, (s.a[0] - self.offset[0], s.a[1] - self.offset[1]),
-                (s.b[0] - self.offset[0], s.b[1] - self.offset[1]) if s.b else None,
-                s.color))
+            self.pattern.add_stitch(replace(
+                s, a=(s.a[0] - self.offset[0], s.a[1] - self.offset[1]),
+                b=((s.b[0] - self.offset[0], s.b[1] - self.offset[1])
+                   if s.b else None)))
         # nested instances translated
         for inst in block.instances:
             ni = BlockInstance(
@@ -116,9 +118,9 @@ class BlockEditorDialog(QDialog):
     def _on_accept(self):
         # write back: raw stitches translated by offset
         self.block.stitches = [
-            Stitch(s.kind, (s.a[0] + self.offset[0], s.a[1] + self.offset[1]),
-                   (s.b[0] + self.offset[0], s.b[1] + self.offset[1]) if s.b else None,
-                   s.color)
+            replace(s, a=(s.a[0] + self.offset[0], s.a[1] + self.offset[1]),
+                    b=((s.b[0] + self.offset[0], s.b[1] + self.offset[1])
+                       if s.b else None))
             for s in self.pattern.stitches.values()
         ]
         self.block.instances = []

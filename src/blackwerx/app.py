@@ -5,14 +5,17 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSize
+from dataclasses import replace
+
+from PySide6.QtCore import Qt, QSize, QSettings
 from PySide6.QtGui import QAction, QKeySequence, QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (QMainWindow, QApplication, QWidget,
                                QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
                                QToolBar, QDockWidget, QFileDialog,
                                QMessageBox, QInputDialog, QDialog,
                                QFormLayout, QComboBox, QCheckBox, QSpinBox,
-                               QDoubleSpinBox, QDialogButtonBox, QMenu)
+                               QDoubleSpinBox, QDialogButtonBox, QMenu,
+                               QSplitter, QToolButton)
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import QUndoView
 
@@ -23,12 +26,15 @@ from .core import project as project_io
 from .core import palette
 from .core.exporters import pdf as pdf_exp, image as img_exp, svg as svg_exp, pat as pat_exp
 from .gui.canvas import PatternCanvas, Tool, CELL
-from .gui.panels import ColorPanel, LibraryPanel, make_block_from_stitches, color_icon
+from .gui.panels import (ColorPanel, LibraryPanel, LayerPanel,
+                         make_block_from_stitches, color_icon)
 from .gui.commands import (DrawStitchesCommand, EraseStitchesCommand,
                            DeleteSelectionCommand, MoveStitchesCommand,
                            TransformInstancesCommand, RecolorCommand,
                            PlaceBlockCommand, ExplodeCommand,
-                           TransformSelectionCommand, CopySelectionCommand)
+                           TransformSelectionCommand, CopySelectionCommand,
+                           MoveToLayerCommand, SplitStitchCommand,
+                           SelectionCommand, ClipBehindCommand)
 from .gui.block_editor import BlockEditorDialog
 from .gui.svg_import_dialog import SvgImportDialog
 from .gui.rulers import Ruler
@@ -39,6 +45,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Black-Werx")
         self.resize(1200, 800)
+        self._settings = QSettings("BlackWerx", "BlackWerx")
 
         self.pattern = Pattern()
         self.library = Library()
@@ -48,11 +55,17 @@ class MainWindow(QMainWindow):
         self._extra_dirty = False   # non-undoable edits (canvas setup)
         self._saved_index = 0       # undo index at last save
         self._mru = []
+        # selection tracking for undo + reselect
+        self._sel_shadow = (frozenset(), frozenset())
+        self._sel_history = []
+        self._sym_warn_key = None
 
         self._build_ui()
         self._build_menus()
         self._wire_canvas()
         self._refresh_all()
+        # repaint + status after undo/redo (commands update selection too)
+        self.undo_stack.indexChanged.connect(self._on_undo_index_changed)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -82,9 +95,15 @@ class MainWindow(QMainWindow):
             self._refresh_rulers)
         self.canvas.verticalScrollBar().valueChanged.connect(
             self._refresh_rulers)
+        # drag guides out of the rulers onto the canvas
+        self.h_ruler.guide_drag.connect(self.canvas.guide_dragging)
+        self.h_ruler.guide_drop.connect(self.canvas.guide_dropped)
+        self.v_ruler.guide_drag.connect(self.canvas.guide_dragging)
+        self.v_ruler.guide_drop.connect(self.canvas.guide_dropped)
 
         # left tool sidebar
         tb = QToolBar("Tools")
+        tb.setObjectName("Tools")
         tb.setIconSize(QSize(22, 22))
         tb.setMovable(False)
         self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, tb)
@@ -104,20 +123,31 @@ class MainWindow(QMainWindow):
             self.tool_group.append((tool, act))
         self._set_tool(Tool.PENCIL)
 
-        # options bar (top): array copies + line width
+        # symmetry dropdown on the tool bar
+        sym_btn = QToolButton(self)
+        sym_btn.setText("Symmetry")
+        sym_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        sym_btn.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextOnly)
+        sym_menu = QMenu(sym_btn)
+        self.sym_actions = {}
+        for axis, label in [
+                ("h", "Left / right"), ("v", "Top / bottom"),
+                ("d", "Diagonal"), ("ad", "Point mirror")]:
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.triggered.connect(
+                lambda _=False, a=axis: self._set_symmetry(a))
+            sym_menu.addAction(act)
+            self.sym_actions[axis] = act
+        sym_btn.setMenu(sym_menu)
+        tb.addWidget(sym_btn)
+
+        # options bar (top): line width
         otb = QToolBar("Options")
+        otb.setObjectName("Options")
         otb.setMovable(False)
         self.addToolBar(otb)
-        otb.addWidget(QLabel("Copies:"))
-        self.copies_spin = QSpinBox()
-        self.copies_spin.setRange(0, 50)
-        self.copies_spin.setValue(0)
-        self.copies_spin.setToolTip(
-            "Array copies for Move/Rotate: 0 moves the original, "
-            "N makes N copies spaced by the drag delta/angle")
-        self.copies_spin.valueChanged.connect(self._on_copies_changed)
-        otb.addWidget(self.copies_spin)
-        otb.addSeparator()
         otb.addWidget(QLabel("Line width:"))
         self.width_spin = QSpinBox()
         self.width_spin.setRange(1, 12)
@@ -130,21 +160,48 @@ class MainWindow(QMainWindow):
         # undo view dock
         self.undo_view = QUndoView(self.undo_stack)
         udock = QDockWidget("History", self)
+        udock.setObjectName("HistoryDock")
         udock.setWidget(self.undo_view)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, udock)
         udock.hide()
 
-        # right dock: colors + library stacked
+        # right dock: resizable splitter with color/layers/library panels
         right = QWidget()
         rlay = QVBoxLayout(right)
-        rlay.setContentsMargins(4, 4, 4, 4)
+        rlay.setContentsMargins(0, 0, 0, 0)
         self.color_panel = ColorPanel()
+        self.layer_panel = LayerPanel()
         self.library_panel = LibraryPanel()
-        rlay.addWidget(self.color_panel)
-        rlay.addWidget(self.library_panel, 1)
+        self.right_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.right_splitter.addWidget(self.color_panel)
+        self.right_splitter.addWidget(self.layer_panel)
+        self.right_splitter.addWidget(self.library_panel)
+        self.right_splitter.setStretchFactor(0, 0)
+        self.right_splitter.setStretchFactor(1, 0)
+        self.right_splitter.setStretchFactor(2, 1)
+        rlay.addWidget(self.right_splitter)
         rdock = QDockWidget("Palette & Library", self)
+        rdock.setObjectName("SideDock")
         rdock.setWidget(right)
+        rdock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetClosable |
+            QDockWidget.DockWidgetFeature.DockWidgetMovable |
+            QDockWidget.DockWidgetFeature.DockWidgetFloatable)
+        self.right_dock = rdock
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, rdock)
+
+        geo = self._settings.value("ui/geometry")
+        if geo:
+            self.restoreGeometry(geo)
+        state = self._settings.value("ui/dock_state")
+        if state:
+            self.restoreState(state)
+        saved_sizes = self._settings.value("ui/right_splitter_sizes")
+        if saved_sizes:
+            # apply after first layout so sizes aren't overridden
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, lambda: self.right_splitter.setSizes(
+                [int(s) for s in saved_sizes]))
 
         self._refresh_rulers()
         self.status_info = QLabel("0 stitches")
@@ -160,6 +217,8 @@ class MainWindow(QMainWindow):
         m = mb.addMenu("&File")
         self._act(m, "&New", self.new_project, "Ctrl+N")
         self._act(m, "&Open…", self.open_project, "Ctrl+O")
+        self.recent_menu = m.addMenu("Open &Recent")
+        self._refresh_recent_menu()
         self._act(m, "&Save", self.save_project, "Ctrl+S")
         self._act(m, "Save &As…", self.save_project_as, "Ctrl+Shift+S")
         m.addSeparator()
@@ -184,6 +243,7 @@ class MainWindow(QMainWindow):
         self._act(m, "&Duplicate", self.duplicate_selection, "Ctrl+D")
         m.addSeparator()
         self._act(m, "Select &All", self.select_all, "Ctrl+A")
+        self._act(m, "&Reselect Last Selection", self.reselect_last)
         self._act(m, "&Clear Selection", self.clear_selection, "Esc")
         m.addSeparator()
         self._act(m, "Canvas &setup…", self.canvas_setup)
@@ -196,6 +256,9 @@ class MainWindow(QMainWindow):
         self._act(m3, "Horizontal", lambda: self.transform_instances("flipx"))
         self._act(m3, "Vertical", lambda: self.transform_instances("flipy"))
         self._act(m, "Recolor selection…", self.recolor_selection)
+        self._act(m, "Split stitch in &half", self.split_selection)
+        self._act(m, "Hide stitches &behind selection",
+                  self.clip_behind_selection)
 
         # View
         m = mb.addMenu("&View")
@@ -203,20 +266,49 @@ class MainWindow(QMainWindow):
         self._act(m, "Zoom &Out", lambda: self.canvas.zoom_centered(0.8), "Ctrl+-")
         self._act(m, "&Reset Zoom", self.canvas.resetTransform, "Ctrl+0")
         m.addSeparator()
-        self.sym_actions = {}
-        for axis, label in [("h", "Mirror left/right"), ("v", "Mirror top/bottom"),
-                            ("d", "Mirror diagonal"), ("ad", "Mirror anti-diagonal")]:
+        self.guides_act = QAction("Show &guides", self)
+        self.guides_act.setCheckable(True)
+        self.guides_act.setChecked(True)
+        self.guides_act.triggered.connect(self._toggle_guides)
+        m.addAction(self.guides_act)
+        self._act(m, "Clear all guides", self.canvas.clear_guides)
+        m.addSeparator()
+        # panel visibility
+        dock_act = QAction("Show side &panel", self)
+        dock_act.setCheckable(True)
+        dock_act.setChecked(True)
+        dock_act.triggered.connect(
+            lambda c: self.right_dock.setVisible(c))
+        m.addAction(dock_act)
+        self.right_dock.visibilityChanged.connect(
+            lambda v: dock_act.setChecked(v))
+        self._panel_acts = []
+        panels = [("Show &colors", self.color_panel),
+                  ("Show &layers", self.layer_panel),
+                  ("Show &blocks", self.library_panel)]
+        for label, w in panels:
             act = QAction(label, self)
             act.setCheckable(True)
-            act.triggered.connect(lambda _=False, a=axis: self._toggle_sym(a))
+            act.setChecked(True)
+            act.triggered.connect(lambda c, ww=w: ww.setVisible(c))
             m.addAction(act)
-            self.sym_actions[axis] = act
+            self._panel_acts.append((act, w))
+        saved_vis = self._settings.value("ui/panel_visibility")
+        if saved_vis is not None:
+            for (act, w), vis in zip(self._panel_acts, saved_vis):
+                on = vis if isinstance(vis, bool) else \
+                    str(vis).lower() in ("true", "1")
+                act.setChecked(on)
+                w.setVisible(on)
 
         # Blocks
         m = mb.addMenu("&Blocks")
         self._act(m, "New block from selection", self.new_block_from_selection)
         self._act(m, "Explode selection (flatten)", lambda: self.explode_selected("flatten"))
         self._act(m, "Explode selection (unlink)", lambda: self.explode_selected("unlink"))
+        m.addSeparator()
+        self._act(m, "Explode ALL instances (flatten)…",
+                  self.explode_all_instances)
 
         # Help
         m = mb.addMenu("&Help")
@@ -243,15 +335,86 @@ class MainWindow(QMainWindow):
         c.rotate_selection.connect(self._on_rotate_selection)
         c.tool_changed.connect(self._on_canvas_tool_changed)
         c.context_menu.connect(self._on_context_menu)
+        c.guides_changed.connect(lambda: setattr(self, "_extra_dirty", True))
         c.cursor_cell_changed.connect(
             lambda x, y: self.statusBar().showMessage(f"cell {x}, {y}"))
-        c.selection_changed.connect(self._update_status)
+        c.selection_changed.connect(self._on_selection_changed)
         self.color_panel.color_changed.connect(self._on_color_changed)
         self.library_panel.place_requested.connect(self._on_library_place)
         self.library_panel.new_from_selection.connect(self.new_block_from_selection)
         self.library_panel.edit_requested.connect(self._on_edit_block)
         self.library_panel.delete_requested.connect(self._on_delete_block)
         self.library_panel.promote_requested.connect(self._on_promote_block)
+        self.layer_panel.layers_changed.connect(self._on_layers_changed)
+        self.layer_panel.active_changed.connect(self._on_active_layer)
+        self.layer_panel.guides_toggled.connect(self._on_guides_toggled)
+        self.layer_panel.guides_locked_toggled.connect(
+            self._on_guides_locked)
+        self.layer_panel.move_selection_requested.connect(
+            self._on_move_selection_to_layer)
+        self.layer_panel.layer_delete_requested.connect(
+            self._on_layer_delete_migrate)
+        self.layer_panel.merge_requested.connect(self._on_merge_layers)
+
+    def _on_layers_changed(self):
+        self._extra_dirty = True
+        self.canvas.refresh()
+        self._update_status()
+
+    def _on_active_layer(self, _lid):
+        self._extra_dirty = True
+        self._update_status()
+
+    def _on_guides_toggled(self, visible):
+        self.canvas.guides_visible = visible
+        self.canvas.viewport().update()
+        self.canvas.guides_changed.emit()
+
+    def _on_guides_locked(self, locked):
+        self.canvas.guides_locked = locked
+
+    def _on_move_selection_to_layer(self, lid):
+        sel = self.canvas.selection
+        keys = list(sel.stitch_keys)
+        uid_list = list(sel.instance_uids)
+        if not keys and not uid_list:
+            self.statusBar().showMessage("Select stitches or blocks first.")
+            return
+        self.undo_stack.push(MoveToLayerCommand(
+            self.pattern, keys, uid_list, lid,
+            selection=self.canvas.selection, sym_ops=self._sym_ops()))
+        self.canvas.refresh()
+        self._update_status()
+
+    def _on_layer_delete_migrate(self, deleted_id, target_id):
+        keys = [s.key for s in self.pattern.stitches.values()
+                if s.layer == deleted_id]
+        uid_list = [i.uid for i in self.pattern.instances
+                    if i.layer == deleted_id]
+        if keys or uid_list:
+            self.undo_stack.push(MoveToLayerCommand(
+                self.pattern, keys, uid_list, target_id))
+
+    def _on_merge_layers(self, ids):
+        """Flatten checked layers into the topmost checked layer."""
+        p = self.pattern
+        survivor = ids[0]
+        for lid in ids[1:]:
+            keys = [s.key for s in p.stitches.values() if s.layer == lid]
+            uid_list = [i.uid for i in p.instances if i.layer == lid]
+            if keys or uid_list:
+                self.undo_stack.push(MoveToLayerCommand(
+                    p, keys, uid_list, survivor,
+                    text=f"Merge layer into {survivor}"))
+        drop = set(ids[1:])
+        p.layers = [l for l in p.layers if l["id"] not in drop]
+        if p.active_layer in drop:
+            p.active_layer = survivor
+        self.layer_panel.checked_layer_ids -= drop
+        self.layer_panel.refresh(p)
+        self.canvas.refresh()
+        self._extra_dirty = True
+        self._update_status()
 
     def _refresh_all(self):
         # keep canvas registry in sync so promoted global blocks resolve
@@ -260,7 +423,67 @@ class MainWindow(QMainWindow):
         self.library_panel.global_blocks = dict(self.library_blocks)
         self.library_panel.project_blocks = dict(self.pattern.blocks)
         self.library_panel.refresh()
+        self.layer_panel.refresh(self.pattern)
+        self.layer_panel.set_guides_visible(self.canvas.guides_visible)
         self._update_status()
+
+    def _on_undo_index_changed(self, *_):
+        try:
+            # commands mutate selection silently; resync the shadow so the
+            # next user-driven change diffs against the true state
+            self._sel_shadow = self._sel_snapshot()
+            self._note_selection(self._sel_shadow)
+            self.canvas.viewport().update()
+            self._update_status()
+        except RuntimeError:
+            pass  # during interpreter/Qt teardown
+
+    # -- selection tracking -------------------------------------------------
+    def _sel_snapshot(self):
+        s = self.canvas.selection
+        return (frozenset(s.stitch_keys), frozenset(s.instance_uids))
+
+    def _note_selection(self, snap):
+        snap = (frozenset(snap[0]), frozenset(snap[1]))
+        if not self._sel_history or self._sel_history[-1] != snap:
+            self._sel_history.append(snap)
+            del self._sel_history[:-50]
+
+    def _on_selection_changed(self):
+        new = self._sel_snapshot()
+        if new == self._sel_shadow:
+            self._update_status()
+            return
+        before = self._sel_shadow
+        self._sel_shadow = new
+        self._note_selection(new)
+        self._record_selection(before, new)
+        self._update_status()
+
+    def _record_selection(self, before, after):
+        """Push (or extend) an undoable selection-change command."""
+        if after == before:
+            return
+        sel = self.canvas.selection
+        keys, uids = after
+        text = "Select" if (keys or uids) else "Deselect"
+        self.undo_stack.push(SelectionCommand(
+            sel, (set(before[0]), set(before[1])),
+            (set(keys), set(uids)), text=text))
+
+    def _apply_selection(self, snap):
+        s = self.canvas.selection
+        s.stitch_keys = set(snap[0])
+        s.instance_uids = set(snap[1])
+        self.canvas.selection_changed.emit()
+        self.canvas.viewport().update()
+
+    def reselect_last(self):
+        """Restore the selection state from before the current one."""
+        if len(self._sel_history) < 2:
+            self.statusBar().showMessage("No previous selection.")
+            return
+        self._apply_selection(self._sel_history[-2])
 
     def _update_status(self):
         n = self.pattern.stitch_count()
@@ -268,10 +491,22 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(
             f"Black-Werx — {self.pattern.name}" +
             (f" — {self._file_path.name}" if self._file_path else ""))
+        self._refresh_sym_warnings()
 
-    def _on_copies_changed(self, v):
-        self.canvas.copies_count = v
-        self.canvas._update_tool_label()
+    def _refresh_sym_warnings(self):
+        """Flag stitches that can't be edited symmetrically (missing orbit
+        counterparts) while symmetry axes are active."""
+        from .core.symmetry import orphan_stitch_keys
+        axes = self.canvas.symmetry_axes
+        key = (self.undo_stack.index(), frozenset(axes),
+               self.pattern.width, self.pattern.height)
+        if key == self._sym_warn_key:
+            return
+        self._sym_warn_key = key
+        warn = orphan_stitch_keys(self.pattern, axes) if axes else set()
+        if warn != self.canvas.sym_warn_keys:
+            self.canvas.sym_warn_keys = warn
+            self.canvas.viewport().update()
 
     # -- MRU / right-click context menu -----------------------------------
     def _record(self, label, fn):
@@ -306,11 +541,18 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "Select a block in the library panel, then click to place.")
 
-    def _toggle_sym(self, axis):
-        if self.sym_actions[axis].isChecked():
+    def _set_symmetry(self, axis):
+        act = self.sym_actions[axis]
+        if act.isChecked():
             self.canvas.symmetry_axes.add(axis)
         else:
             self.canvas.symmetry_axes.discard(axis)
+        self.canvas.viewport().update()
+
+    def _toggle_guides(self, checked):
+        self.canvas.guides_visible = checked
+        self.layer_panel.set_guides_visible(checked)
+        self.canvas.viewport().update()
 
     def canvas_setup(self):
         dlg = CanvasSetupDialog(self.pattern, self)
@@ -323,6 +565,9 @@ class MainWindow(QMainWindow):
             else:
                 self.pattern.width = max(1, round(v["size_w"]))
                 self.pattern.height = max(1, round(v["size_h"]))
+            # even counts only: keeps the symmetry center on a grid dot
+            self.pattern.width += self.pattern.width % 2
+            self.pattern.height += self.pattern.height % 2
             self.canvas._update_scene_rect()
             self.canvas.centerOn(self.canvas.pattern_center_scene())
             self.canvas.viewport().update()
@@ -331,7 +576,8 @@ class MainWindow(QMainWindow):
             self._extra_dirty = True
             self.statusBar().showMessage(
                 f"Fabric: {v['aida']} ct aida, stitch "
-                f"{v['w']}×{v['h']} mm")
+                f"{v['w']}×{v['h']} mm, canvas "
+                f"{self.pattern.width}×{self.pattern.height} (even counts)")
 
     def _on_color_changed(self, spec):
         self.canvas.current_color = spec
@@ -339,6 +585,14 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------- canvas events
     def _on_draw_stitches(self, stitches):
+        lid = self.pattern.active_layer
+        if self.pattern.layer_locked(lid):
+            name = (self.pattern.layer_def(lid) or {}).get("name", lid)
+            self.statusBar().showMessage(
+                f"Cannot draw: layer '{name}' is locked.")
+            return
+        if any(s.layer != lid for s in stitches):
+            stitches = [replace(s, layer=lid) for s in stitches]
         self.undo_stack.push(DrawStitchesCommand(self.pattern, stitches))
         self.canvas.refresh()
         self._update_status()
@@ -347,11 +601,15 @@ class MainWindow(QMainWindow):
         keys = []
         for c in cells:
             for s in self.pattern.get_stitches_in_cell(c):
-                keys.append(s.key)
+                if not self.pattern.layer_locked(s.layer) \
+                        and self.pattern.layer_visible(s.layer):
+                    keys.append(s.key)
         # also erase backstitches passing near cell
         keys = list(dict.fromkeys(keys))
         if keys:
-            self.undo_stack.push(EraseStitchesCommand(self.pattern, keys))
+            self.undo_stack.push(EraseStitchesCommand(
+            self.pattern, keys, selection=self.canvas.selection,
+            sym_ops=self._sym_ops()))
             self.canvas.refresh()
             self._update_status()
 
@@ -382,8 +640,19 @@ class MainWindow(QMainWindow):
             uid=self.pattern.next_instance_id(),
             block_id=block.id, scope=scope,
             transform=local.then(Transform.translation(gx - ax, gy - ay)),
-            linked=True)
-        self.undo_stack.push(PlaceBlockCommand(self.pattern, inst))
+            linked=True, layer=self.pattern.active_layer)
+        insts = [inst]
+        # live symmetry: mirror the placement into the other quadrant(s)
+        from .core.symmetry import symmetry_matrices
+        p = self.pattern
+        for m in symmetry_matrices(self.canvas.symmetry_axes,
+                                   p.width, p.height):
+            mt = Transform(*m)
+            insts.append(BlockInstance(
+                uid=p.next_instance_id(), block_id=block.id, scope=scope,
+                transform=inst.transform.then(mt),
+                linked=True, layer=inst.layer))
+        self.undo_stack.push(PlaceBlockCommand(self.pattern, insts))
         self.canvas.refresh()
         self._update_status()
 
@@ -394,62 +663,171 @@ class MainWindow(QMainWindow):
             return
         self._record("Edit: Delete Selection", self.delete_selection)
         self.undo_stack.push(DeleteSelectionCommand(
-            self.pattern, sel.stitch_keys, sel.instance_uids))
-        sel.clear()
+            self.pattern, sel.stitch_keys, sel.instance_uids,
+            selection=self.canvas.selection, sym_ops=self._sym_ops()))
         self.canvas.refresh()
         self.selection_changed = True
         self._update_status()
 
     def select_all(self):
-        self.canvas.selection.stitch_keys = set(self.pattern.stitches.keys())
-        self.canvas.selection.instance_uids = {i.uid for i in self.pattern.instances}
+        p = self.pattern
+        self.canvas.selection.stitch_keys = {
+            s.key for s in p.stitches.values()
+            if not p.layer_locked(s.layer) and p.layer_visible(s.layer)}
+        self.canvas.selection.instance_uids = {
+            i.uid for i in p.instances
+            if not (i.layer and (p.layer_locked(i.layer)
+                                 or not p.layer_visible(i.layer)))}
+        self.canvas.selection_changed.emit()
         self.canvas.viewport().update()
 
     def clear_selection(self):
         self.canvas.selection.clear()
+        self.canvas.selection_changed.emit()
         self.canvas.viewport().update()
 
+    def split_selection(self):
+        sel = self.canvas.selection
+        keys = [k for k in sel.stitch_keys
+                if (s := self.pattern.stitches.get(k)) is not None
+                and s.kind is StitchKind.BACK and s.b is not None]
+        if not keys:
+            self.statusBar().showMessage(
+                "Select backstitch segments to split.")
+            return
+        self.undo_stack.push(SplitStitchCommand(
+            self.pattern, keys, selection=self.canvas.selection,
+            sym_ops=self._sym_ops()))
+        self.canvas.refresh()
+        self._update_status()
+
+    def clip_behind_selection(self):
+        """Clip all non-selected stitches to the outside of the closed
+        shape formed by the selected backstitches (raw or inside blocks)."""
+        sel = self.canvas.selection
+        keys = [k for k in sel.stitch_keys
+                if (s := self.pattern.stitches.get(k)) is not None
+                and s.kind is StitchKind.BACK and s.b is not None]
+        uids = [u for u in sel.instance_uids
+                if any(i.uid == u for i in self.pattern.instances)]
+        if not keys and not uids:
+            self.statusBar().showMessage(
+                "Select backstitch(s) or a block forming a closed shape.")
+            return
+        cmd = ClipBehindCommand(
+            self.pattern, keys, boundary_uids=uids,
+            library_blocks=self.library_blocks)
+        self.undo_stack.push(cmd)
+        removed, added = cmd.stats
+        if removed == 0:
+            self.statusBar().showMessage(
+                "Nothing was inside the selected shape — check that the "
+                "outline is closed and surrounds the target stitches.")
+        else:
+            self.statusBar().showMessage(
+                f"Clipped {removed} stitch(es) behind the shape "
+                f"({added} piece(s) kept).")
+        self.canvas.refresh()
+        self._update_status()
+
     def transform_instances(self, op):
-        uids = self.canvas.selection.instance_uids
-        if uids:
-            lib = {**self.library_blocks, **self.pattern.blocks}
-            self.undo_stack.push(
-                TransformInstancesCommand(self.pattern, uids, op,
-                                          library_blocks=lib))
-            self._record(f"Edit: Transform ({op})",
-                         lambda o=op: self.transform_instances(o))
-            self.canvas.refresh()
+        sel = self.canvas.selection
+        uids = list(sel.instance_uids)
+        keys = list(sel.stitch_keys)
+        if not uids and not keys:
+            self.statusBar().showMessage(
+                "Transform: select stitches or block instances first.")
+            return
+        stitch_op = None
+        if keys:
+            # bbox center of selected stitches (cell coords)
+            xs, ys = [], []
+            for k in keys:
+                s = self.pattern.stitches.get(k)
+                if s is None:
+                    continue
+                xs += [s.a[0], s.b[0] if s.b else s.a[0]]
+                ys += [s.a[1], s.b[1] if s.b else s.a[1]]
+            if xs:
+                cx, cy = int(round((min(xs) + max(xs)) / 2)), \
+                    int(round((min(ys) + max(ys)) / 2))
+                inner = Transform.from_semantic(
+                    0, 0, int(op[3:]) if op.startswith("rot") else 0,
+                    op == "flipx", op == "flipy")
+                stitch_op = (Transform.translation(-cx, -cy)
+                             .then(inner)
+                             .then(Transform.translation(cx, cy)))
+        lib = {**self.library_blocks, **self.pattern.blocks}
+        self.undo_stack.push(
+            TransformInstancesCommand(self.pattern, uids, op,
+                                      library_blocks=lib,
+                                      stitch_keys=keys, stitch_op=stitch_op,
+                                      selection=sel,
+                                      sym_ops=self._sym_ops()))
+        self._record(f"Edit: Transform ({op})",
+                     lambda o=op: self.transform_instances(o))
+        self.canvas.refresh()
 
     # -- move / rotate / duplicate -----------------------------------------
     def _sel_ids(self):
         return (list(self.canvas.selection.stitch_keys),
                 list(self.canvas.selection.instance_uids))
 
-    def _on_move_selection(self, dx, dy, copies):
-        keys, uids = self._sel_ids()
-        if copies <= 0:
-            self.undo_stack.push(MoveStitchesCommand(
-                self.pattern, keys, uids, dx, dy))
-        else:
-            specs = [(k * dx, k * dy, 0, 0, 0)
-                     for k in range(1, copies + 1)]
-            self.undo_stack.push(CopySelectionCommand(
-                self.pattern, keys, uids, specs,
-                text=f"Move +{copies} copies"))
-        self.canvas.refresh()
-        self._update_status()
+    def _sym_ops(self):
+        """Live symmetry transforms ([] when symmetry is off)."""
+        if not self.canvas.symmetry_axes:
+            return []
+        from .core.symmetry import symmetry_matrices
+        return [Transform(*m) for m in symmetry_matrices(
+            self.canvas.symmetry_axes, self.pattern.width,
+            self.pattern.height)]
 
-    def _on_rotate_selection(self, cx, cy, q, copies):
+    def _on_move_selection(self, dx, dy):
+        dlg = TransformOptionsDialog("Move", self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        copies, keep = dlg.values()
+        self._apply_transform_op((dx, dy, 0, 0, 0), copies, keep,
+                                 "Move")
+
+    def _on_rotate_selection(self, cx, cy, q):
+        dlg = TransformOptionsDialog("Rotate", self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        copies, keep = dlg.values()
+        self._apply_transform_op((0, 0, cx, cy, q), copies, keep,
+                                 "Rotate")
+
+    def _apply_transform_op(self, op, copies, keep, label):
+        """op = (dx, dy, cx, cy, q): translate then rotate q quarter-turns
+        about (cx, cy). copies/keep drive array duplication."""
+        dx, dy, cx, cy, q = op
         keys, uids = self._sel_ids()
-        if copies <= 0:
-            self.undo_stack.push(TransformSelectionCommand(
-                self.pattern, keys, uids, cx, cy, q))
+        if not keys and not uids:
+            return
+        sel = self.canvas.selection
+        plain = copies <= 0 or (not keep and copies <= 1)
+        if plain:
+            if q == 0 and (dx or dy):
+                self.undo_stack.push(MoveStitchesCommand(
+                    self.pattern, keys, uids, dx, dy, selection=sel,
+                    sym_ops=self._sym_ops()))
+            else:
+                self.undo_stack.push(TransformSelectionCommand(
+                    self.pattern, keys, uids, cx, cy, q, selection=sel,
+                    sym_ops=self._sym_ops()))
         else:
-            specs = [(0, 0, cx, cy, (k * q) % 4)
-                     for k in range(1, copies + 1)]
+            # keep: N copies at steps 1..N, original untouched
+            # !keep: original takes step 1, extras at steps 2..N
+            steps = range(1, copies + 1) if keep else range(2, copies + 1)
+            specs = [(k * dx, k * dy, cx, cy, (k * q) % 4)
+                     for k in steps]
+            orig_op = None if keep else op
             self.undo_stack.push(CopySelectionCommand(
                 self.pattern, keys, uids, specs,
-                text=f"Rotate +{copies} copies"))
+                text=f"{label} +{len(specs)} copies",
+                orig_op=orig_op, selection=sel,
+                sym_ops=self._sym_ops()))
         self.canvas.refresh()
         self._update_status()
 
@@ -462,11 +840,10 @@ class MainWindow(QMainWindow):
         self._record("Edit: Duplicate", self.duplicate_selection)
         keys, uids = self._sel_ids()
         cmd = CopySelectionCommand(
-            self.pattern, keys, uids, [(1, 1, 0, 0, 0)], text="Duplicate")
+            self.pattern, keys, uids, [(1, 1, 0, 0, 0)], text="Duplicate",
+            selection=sel, sym_ops=self._sym_ops())
         self.undo_stack.push(cmd)
-        # select only the fresh copies so Move acts on them
-        sel.stitch_keys = set(cmd.created_stitch_keys)
-        sel.instance_uids = set(cmd.created_uids)
+        # command already selected the copies; enter Move to drag them
         self.canvas.viewport().update()
         self._set_tool(Tool.MOVE)
         self.canvas.refresh()
@@ -494,7 +871,8 @@ class MainWindow(QMainWindow):
         mapping = {c: new for c in old_colors}
         self._record("Edit: Recolor selection", self.recolor_selection)
         self.undo_stack.push(RecolorCommand(
-            self.pattern, mapping, sel.stitch_keys, sel.instance_uids))
+            self.pattern, mapping, sel.stitch_keys, sel.instance_uids,
+            sym_ops=self._sym_ops()))
         self.canvas.refresh()
 
     def explode_selected(self, mode):
@@ -510,8 +888,29 @@ class MainWindow(QMainWindow):
             if inst:
                 self.undo_stack.push(ExplodeCommand(
                     self.pattern, inst, mode, self.library_blocks,
-                    text=f"Explode ({mode})"))
-        self.canvas.selection.instance_uids.clear()
+                    text=f"Explode ({mode})",
+                    selection=self.canvas.selection))
+        self.canvas.refresh()
+        self._refresh_all()
+        self._update_status()
+
+    def explode_all_instances(self):
+        """Flatten every placed instance into raw stitches (with confirm)."""
+        insts = list(self.pattern.instances)
+        if not insts:
+            self.statusBar().showMessage("No block instances to explode.")
+            return
+        r = QMessageBox.question(
+            self, "Explode all instances",
+            f"Flatten all {len(insts)} block instance(s) into raw "
+            "stitches? This cannot be undone selectively.")
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        for inst in insts:
+            self.undo_stack.push(ExplodeCommand(
+                self.pattern, inst, "flatten", self.library_blocks,
+                text="Explode all (flatten)",
+                selection=self.canvas.selection))
         self.canvas.refresh()
         self._refresh_all()
         self._update_status()
@@ -589,17 +988,60 @@ class MainWindow(QMainWindow):
         self.undo_stack.clear()
         self._refresh_all()
 
+    # -- recent files ---------------------------------------------------
+    _RECENT_KEY = "recentFiles"
+    _RECENT_MAX = 10
+
+    def _recent_files(self):
+        v = QSettings("BlackWerx", "BlackWerx").value(self._RECENT_KEY) or []
+        if isinstance(v, str):
+            v = [v]
+        return [str(p) for p in v]
+
+    def _refresh_recent_menu(self):
+        self.recent_menu.clear()
+        files = self._recent_files()
+        if not files:
+            self.recent_menu.addAction("(empty)").setEnabled(False)
+            return
+        for p in files:
+            act = QAction(p, self)
+            act.setToolTip(p)
+            act.triggered.connect(lambda _=False, path=p: self._open_path(path))
+            self.recent_menu.addAction(act)
+        self.recent_menu.addSeparator()
+        self.recent_menu.addAction("Clear Recent", self._clear_recent)
+
+    def _add_recent(self, path):
+        p = str(path)
+        files = [r for r in self._recent_files() if r != p]
+        files.insert(0, p)
+        QSettings("BlackWerx", "BlackWerx").setValue(
+            self._RECENT_KEY, files[:self._RECENT_MAX])
+        self._refresh_recent_menu()
+
+    def _clear_recent(self):
+        QSettings("BlackWerx", "BlackWerx").setValue(self._RECENT_KEY, [])
+        self._refresh_recent_menu()
+
+    def _open_path(self, path):
+        self._load_path(path)
+
     def open_project(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open project", "", "Black-Werx project (*.bwpx)")
         if not path:
             return
+        self._load_path(path)
+
+    def _load_path(self, path):
         try:
             self.pattern = project_io.load_project(path)
         except Exception as e:
             QMessageBox.critical(self, "Open failed", str(e))
             return
         self._file_path = Path(path)
+        self._add_recent(path)
         self._extra_dirty = False
         self._saved_index = 0
         self.canvas.set_pattern(self.pattern)
@@ -628,6 +1070,8 @@ class MainWindow(QMainWindow):
     def _mark_saved(self):
         self._saved_index = self.undo_stack.index()
         self._extra_dirty = False
+        if self._file_path is not None:
+            self._add_recent(self._file_path)
 
     def import_svg(self):
         dlg = SvgImportDialog(self)
@@ -639,10 +1083,11 @@ class MainWindow(QMainWindow):
             # place at center of current view-ish: offset so result centered
             # on pattern; simple: place at (2,2)
             ox, oy = 2, 2
-            stitches = [Stitch(s.kind, (s.a[0] + ox, s.a[1] + oy),
-                               (s.b[0] + ox, s.b[1] + oy) if s.b else None,
-                               s.color)
-                        for s in r.stitches]
+            stitches = [replace(
+                s, a=(s.a[0] + ox, s.a[1] + oy),
+                b=((s.b[0] + ox, s.b[1] + oy) if s.b else None),
+                layer=self.pattern.active_layer)
+                for s in r.stitches]
             if dlg.as_block.isChecked():
                 block = make_block_from_stitches("SVG import", stitches)
                 self.pattern.blocks[block.id] = block
@@ -658,6 +1103,44 @@ class MainWindow(QMainWindow):
             self._update_status()
 
     # ------------------------------------------------------------- export
+    def _export_options(self, style):
+        """Small options dialog before export: symbol set + full canvas.
+        Returns (symbol_style, full_canvas) or None if cancelled."""
+        from .core.exporters.chart import SYMBOL_STYLES
+        from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QComboBox,
+                                       QCheckBox, QFormLayout, QLabel)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Export options")
+        form = QFormLayout(dlg)
+        labels = {"shapes": "Shapes (• ▲ ■ ◆ …)",
+                  "letters": "Letters (A B C …)",
+                  "numbers": "Numbers (1 2 3 …)",
+                  "dmc": "DMC numbers"}
+        keys = SYMBOL_STYLES
+        combo = QComboBox()
+        combo.addItems([labels[k] for k in keys])
+        cur = self._settings.value("export/symbol_style", "shapes")
+        combo.setCurrentIndex(keys.index(cur) if cur in keys else 0)
+        combo.setEnabled(style == "symbol" or style is None)
+        form.addRow("Symbol set:", combo)
+        full = QCheckBox("Export entire canvas (not just stitches)")
+        full.setChecked(bool(self._settings.value("export/full_canvas", False)))
+        form.addRow(full)
+        if style == "realistic":
+            form.addRow(QLabel("(symbol set applies to symbol charts only)"))
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        sym = keys[combo.currentIndex()]
+        fc = full.isChecked()
+        self._settings.setValue("export/symbol_style", sym)
+        self._settings.setValue("export/full_canvas", fc)
+        return sym, fc
+
     def export(self, fmt, style):
         if self.pattern.stitch_count() == 0 and not self.pattern.instances:
             QMessageBox.information(self, "Export", "Pattern is empty.")
@@ -670,17 +1153,29 @@ class MainWindow(QMainWindow):
             self, f"Export {fmt.upper()}", "", filters[fmt])
         if not path:
             return
+        if fmt == "pat":
+            opts = ("shapes", False)
+        else:
+            opts = self._export_options(style)
+            if opts is None:
+                return
+        sym_style, full_canvas = opts
         try:
             lib = {b.id: b for b in self.library.all()}
             if fmt == "pdf":
                 pdf_exp.export_pdf(self.pattern, path, style=style or "symbol",
-                                   library_blocks=lib)
+                                   library_blocks=lib, symbol_style=sym_style,
+                                   full_canvas=full_canvas)
             elif fmt == "png":
                 img_exp.export_png(self.pattern, path,
-                                   style=style or "symbol", library_blocks=lib)
+                                   style=style or "symbol", library_blocks=lib,
+                                   symbol_style=sym_style,
+                                   full_canvas=full_canvas)
             elif fmt == "svg":
                 svg_exp.export_svg(self.pattern, path,
-                                   style=style or "realistic", library_blocks=lib)
+                                   style=style or "realistic", library_blocks=lib,
+                                   symbol_style=sym_style,
+                                   full_canvas=full_canvas)
             elif fmt == "pat":
                 pat_exp.export_pat(self.pattern, path, library_blocks=lib)
             QMessageBox.information(self, "Export", f"Saved to {path}")
@@ -693,6 +1188,13 @@ class MainWindow(QMainWindow):
                 or self._extra_dirty)
 
     def closeEvent(self, event):
+        self._settings.setValue("ui/geometry", self.saveGeometry())
+        self._settings.setValue("ui/dock_state", self.saveState())
+        self._settings.setValue("ui/right_splitter_sizes",
+                                self.right_splitter.sizes())
+        self._settings.setValue(
+            "ui/panel_visibility",
+            [act.isChecked() for act, _ in self._panel_acts])
         import os
         if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
             event.accept()   # headless/test runs: never block on a dialog
@@ -725,6 +1227,54 @@ class MainWindow(QMainWindow):
         QMessageBox.about(self, "About Black-Werx",
                           "Black-Werx — blackwork embroidery pattern editor\n"
                           "Python + PySide6")
+
+
+class TransformOptionsDialog(QDialog):
+    """LibreCAD-style commit options for Move/Rotate.
+
+    Copies = total displaced items. 'Keep original' leaves the source
+    untouched and makes Copies extra copies; unchecked, the original is
+    transformed and takes the first step (Copies-1 extras follow).
+    Always shown on commit; remembers last used values.
+    """
+
+    _memory = {"copies": 1, "keep": False}
+
+    def __init__(self, action, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{action} options")
+        form = QFormLayout(self)
+
+        self.copies = QSpinBox()
+        self.copies.setRange(0, 50)
+        self.copies.setValue(self._memory["copies"])
+        form.addRow("Copies:", self.copies)
+
+        self.keep = QCheckBox("Keep original")
+        self.keep.setChecked(self._memory["keep"])
+        form.addRow(self.keep)
+
+        hint = QLabel(
+            "Copies counts displaced items. With 'Keep original' the "
+            "source stays put and N copies are made; without it the "
+            "original takes the first step and N-1 copies follow. "
+            "0 copies just moves/rotates the original.")
+        hint.setWordWrap(True)
+        form.addRow(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def accept(self):
+        self._memory["copies"] = self.copies.value()
+        self._memory["keep"] = self.keep.isChecked()
+        super().accept()
+
+    def values(self):
+        return self.copies.value(), self.keep.isChecked()
 
 
 class CanvasSetupDialog(QDialog):
@@ -794,7 +1344,9 @@ class CanvasSetupDialog(QDialog):
         hint = QLabel(
             "Stitch pitch defaults to 25.4 ÷ aida count mm. "
             "Changing the count auto-fills width/height — edit them "
-            "afterwards for custom fabrics.")
+            "afterwards for custom fabrics. Canvas counts are rounded "
+            "up to even numbers so the symmetry center stays on a "
+            "grid intersection.")
         hint.setWordWrap(True)
         form.addRow(hint)
 

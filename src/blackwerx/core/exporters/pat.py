@@ -71,8 +71,8 @@ def export_pat(pattern: Pattern, path: str | Path, *,
 def pattern_bounds_all(stitches) -> tuple[int, int, int, int]:
     xs, ys = [], []
     for s in stitches:
-        for p in ([s.a] + ([s.b] if s.b else [])):
-            xs.append(p[0]); ys.append(p[1])
+        for px, py in s.extent_points():
+            xs.append(px); ys.append(py)
     if not xs:
         return (0, 0, 0, 0)
     return min(xs), min(ys), max(xs), max(ys)

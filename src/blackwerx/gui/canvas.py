@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import math
 from enum import Enum
 
-from PySide6.QtCore import Qt, Signal, QRectF, QPointF
+from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QPoint
 from PySide6.QtGui import (QColor, QPen, QPainter, QPainterPath, QFont,
                            QWheelEvent, QMouseEvent, QCursor, QPixmap,
                            QImage)
 from PySide6.QtWidgets import (QGraphicsView, QGraphicsScene,
                                QGraphicsItem, QAbstractScrollArea, QLabel)
 
-from ..core.model import Pattern, Stitch, StitchKind
+from ..core.model import Pattern, Stitch, StitchKind, Transform
 from ..core import palette
 
 CELL = 20.0          # scene units per stitch
@@ -67,36 +68,115 @@ class PatternItem(QGraphicsItem):
         painter.drawRect(QRectF(-0.5 * CELL, -0.5 * CELL,
                                 p.width * CELL, p.height * CELL))
 
-        # grid lines
-        pen_minor = QPen(QColor("#d8d0c0"), 0.4)
-        pen_major = QPen(QColor("#a89880"), 0.8)
-        painter.setPen(pen_minor)
+        # dot grid: intersections are holes; darker every GRID_MAJOR
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#c9bfa9"))
         for gx in range(minx, maxx + 2):
-            painter.drawLine(gx * CELL, miny * CELL, gx * CELL, (maxy + 1) * CELL)
-        for gy in range(miny, maxy + 2):
-            painter.drawLine(minx * CELL, gy * CELL, (maxx + 1) * CELL, gy * CELL)
-        painter.setPen(pen_major)
+            for gy in range(miny, maxy + 2):
+                painter.drawEllipse(QRectF(gx * CELL - 1.4,
+                                            gy * CELL - 1.4, 2.8, 2.8))
+        painter.setBrush(QColor("#6f6046"))
         for gx in range(minx - (minx % GRID_MAJOR), maxx + 2, GRID_MAJOR):
-            painter.drawLine(gx * CELL, miny * CELL, gx * CELL, (maxy + 1) * CELL)
-        for gy in range(miny - (miny % GRID_MAJOR), maxy + 2, GRID_MAJOR):
-            painter.drawLine(minx * CELL, gy * CELL, (maxx + 1) * CELL, gy * CELL)
+            for gy in range(miny - (miny % GRID_MAJOR), maxy + 2,
+                            GRID_MAJOR):
+                painter.drawEllipse(QRectF(gx * CELL - 2.4,
+                                            gy * CELL - 2.4, 4.8, 4.8))
 
-        # stitches (raw pattern)
+        # stitches (raw pattern), honoring layer visibility + display color
+        warn = c.sym_warn_keys
         for s in p.stitches.values():
-            self._draw_stitch(painter, s, palette.resolve(s.color))
+            if not p.layer_visible(s.layer):
+                continue
+            override = p.layer_color(s.layer)
+            self._draw_stitch(painter, s,
+                              override or palette.resolve(s.color))
+            if warn and s.key in warn:
+                # orange ring: editing this stitch can't stay symmetric
+                pa, pb = s.endpoints()
+                mx = (pa[0] + (pb[0] if pb else pa[0])) / 2
+                my = (pa[1] + (pb[1] if pb else pa[1])) / 2
+                painter.setPen(QPen(QColor("#ff8800"), 1.6))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(QRectF((mx - 0.32) * CELL,
+                                            (my - 0.32) * CELL,
+                                            0.64 * CELL, 0.64 * CELL))
 
-        # canvas center marker (always visible)
-        ccx = (p.width - 1) / 2 * CELL
-        ccy = (p.height - 1) / 2 * CELL
+        # guides (non-printing, view-only)
+        if c.guides_visible or c._guide_drag is not None \
+                or c._guide_move is not None:
+            br = self.boundingRect()
+            x0, x1 = br.left() / CELL, br.right() / CELL
+            y0, y1 = br.top() / CELL, br.bottom() / CELL
+
+            def seg_h(gy):
+                return (br.left(), gy * CELL, br.right(), gy * CELL)
+
+            def seg_v(gx):
+                return (gx * CELL, br.top(), gx * CELL, br.bottom())
+
+            def seg_d1(cc):   # y = x + c
+                xa, xb = max(x0, y0 - cc), min(x1, y1 - cc)
+                if xa >= xb:
+                    return None
+                return (xa * CELL, (xa + cc) * CELL,
+                        xb * CELL, (xb + cc) * CELL)
+
+            def seg_d2(cc):   # y = -x + c
+                xa, xb = max(x0, cc - y1), min(x1, cc - y0)
+                if xa >= xb:
+                    return None
+                return (xa * CELL, (-xa + cc) * CELL,
+                        xb * CELL, (-xb + cc) * CELL)
+
+            painter.setPen(QPen(QColor("#00aaaa"), 1,
+                                Qt.PenStyle.DashLine))
+            for gy in c.guides_h:
+                painter.drawLine(*seg_h(gy))
+            for gx in c.guides_v:
+                painter.drawLine(*seg_v(gx))
+            for cc in c.guides_d1:
+                s = seg_d1(cc)
+                if s:
+                    painter.drawLine(*s)
+            for cc in c.guides_d2:
+                s = seg_d2(cc)
+                if s:
+                    painter.drawLine(*s)
+            # guide being dragged out of a ruler
+            if c._guide_drag is not None:
+                kind, val = c._guide_drag
+                painter.setPen(QPen(QColor("#ffaa00"), 1.5))
+                seg = {"h": seg_h, "v": seg_v,
+                       "d1": seg_d1, "d2": seg_d2}[kind](val)
+                if seg:
+                    painter.drawLine(*seg)
+            # guide being repositioned
+            if c._guide_move is not None:
+                kind = c._guide_move["kind"]
+                val = c._guide_move["cur"]
+                painter.setPen(QPen(QColor("#ff5500"), 2.5))
+                seg = {"h": seg_h, "v": seg_v,
+                       "d1": seg_d1, "d2": seg_d2}[kind](val)
+                if seg:
+                    painter.drawLine(*seg)
+
+        # canvas center marker (always visible) — on a grid intersection
+        # (dot), matching the symmetry axes at width/2, height/2
+        ccx = p.width / 2 * CELL
+        ccy = p.height / 2 * CELL
         painter.setPen(QPen(QColor("#cc2266"), 1.2))
         painter.drawLine(ccx - 7, ccy, ccx + 7, ccy)
         painter.drawLine(ccx, ccy - 7, ccx, ccy + 7)
         painter.drawEllipse(QRectF(ccx - 2.5, ccy - 2.5, 5, 5))
 
-        # resolved block instances (cached)
+        # resolved block instances (cached), honoring layer visibility
         for inst in p.instances:
             for s in c.resolved_stitches(inst):
-                col = palette.resolve(c.instance_color(inst, s.color))
+                if not p.layer_visible(s.layer):
+                    continue
+                override = p.layer_color(s.layer)
+                col = override or palette.resolve(
+                    c.instance_color(inst, s.color))
                 self._draw_stitch(painter, s, col, alpha=0.95)
 
         # selection highlight
@@ -119,27 +199,29 @@ class PatternItem(QGraphicsItem):
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
         if s.kind is StitchKind.X:
-            cx, cy = s.a[0] * CELL, s.a[1] * CELL
-            h = CELL * 0.42
+            cx, cy = (s.a[0] + 0.5) * CELL, (s.a[1] + 0.5) * CELL
+            h = CELL * 0.5
             path = QPainterPath()
             path.moveTo(cx - h, cy - h); path.lineTo(cx + h, cy + h)
             path.moveTo(cx + h, cy - h); path.lineTo(cx - h, cy + h)
             painter.drawPath(path)
         else:
-            painter.drawLine(s.a[0] * CELL, s.a[1] * CELL,
-                             s.b[0] * CELL, s.b[1] * CELL)
+            pa, pb = s.endpoints()
+            painter.drawLine(pa[0] * CELL, pa[1] * CELL,
+                             pb[0] * CELL, pb[1] * CELL)
 
     def _draw_stitch_outline(self, painter, s: Stitch):
         pen = QPen(QColor("#2266ff"), 2.5)
         painter.setPen(pen)
         if s.kind is StitchKind.X:
-            cx, cy = s.a[0] * CELL, s.a[1] * CELL
-            h = CELL * 0.45
+            cx, cy = (s.a[0] + 0.5) * CELL, (s.a[1] + 0.5) * CELL
+            h = CELL * 0.5
             painter.drawLine(cx - h, cy - h, cx + h, cy + h)
             painter.drawLine(cx + h, cy - h, cx - h, cy + h)
         else:
-            painter.drawLine(s.a[0] * CELL, s.a[1] * CELL,
-                             s.b[0] * CELL, s.b[1] * CELL)
+            pa, pb = s.endpoints()
+            painter.drawLine(pa[0] * CELL, pa[1] * CELL,
+                             pb[0] * CELL, pb[1] * CELL)
 
 
 class Selection:
@@ -167,9 +249,10 @@ class PatternCanvas(QGraphicsView):
     # Block, scope, gx, gy, anchor, rot, mirror_x, mirror_y
     tool_changed = Signal(object)
     context_menu = Signal(object)   # viewport pos for right-click menu
-    move_selection = Signal(int, int, int)          # dx, dy, copies
-    rotate_selection = Signal(int, int, int, int)   # cx, cy, quarters, copies
+    move_selection = Signal(int, int)               # dx, dy
+    rotate_selection = Signal(int, int, int)        # cx, cy, quarters
     view_changed = Signal()                          # zoom/resize for rulers
+    guides_changed = Signal()                        # guides edited (dirty)
     selection_changed = Signal()
     status_message = Signal(str)
 
@@ -181,6 +264,7 @@ class PatternCanvas(QGraphicsView):
         self.current_color = "#000000"
         self.fabric_color = "#F5F0E6"
         self.symmetry_axes: set = set()
+        self.sym_warn_keys: set = set()   # stitches w/o full symmetry orbit
         self.selection = Selection()
         self.pending_block = None  # Block to place
         self.pending_scope = "project"
@@ -204,7 +288,15 @@ class PatternCanvas(QGraphicsView):
         self._last_mouse_scene = QPointF(0, 0)
         self._ghost_cell = None
         self._back_current = None
-        self.copies_count = 1        # array copies for move/rotate tools
+        # guides (view-only, snapped to grid lines)
+        self.guides_h: set = set()   # horizontal guide row (cell y)
+        self.guides_v: set = set()   # vertical guide col (cell x)
+        self.guides_d1: set = set()  # "/" diag: y = x + c
+        self.guides_d2: set = set()  # "\" diag: y = -x + c
+        self.guides_visible = True
+        self.guides_locked = False   # locked guides can't be grabbed/moved
+        self._guide_drag = None      # (kind_str, value) preview while dragging
+        self._guide_move = None      # dict while editing a placed guide
         # MOVE tool state (scene coords)
         self._move_anchor = None
         self._move_cur = None
@@ -232,6 +324,29 @@ class PatternCanvas(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # high-contrast scrollbars: light track, dark chunky handle
+        self.setStyleSheet("""
+            QScrollBar:vertical { background:#dcdcdc; width:14px;
+                                  margin:0px; border-left:1px solid #bbb; }
+            QScrollBar::handle:vertical { background:#5a5a5a;
+                                          min-height:28px; border-radius:4px;
+                                          margin:2px; }
+            QScrollBar::handle:vertical:hover { background:#333; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height:0px; }
+            QScrollBar:horizontal { background:#dcdcdc; height:14px;
+                                    margin:0px; border-top:1px solid #bbb; }
+            QScrollBar::handle:horizontal { background:#5a5a5a;
+                                            min-width:28px;
+                                            border-radius:4px; margin:2px; }
+            QScrollBar::handle:horizontal:hover { background:#333; }
+            QScrollBar::add-line:horizontal,
+            QScrollBar::sub-line:horizontal { width:0px; }
+        """)
+        # scrollbars are siblings of the viewport — give them an explicit
+        # arrow cursor so they never inherit the tool cursor
+        self.horizontalScrollBar().setCursor(Qt.CursorShape.ArrowCursor)
+        self.verticalScrollBar().setCursor(Qt.CursorShape.ArrowCursor)
         self.setMouseTracking(True)
         self._update_scene_rect()
         self.refresh_cursor()
@@ -288,8 +403,6 @@ class PatternCanvas(QGraphicsView):
                 extras.append("flipV")
             if extras:
                 text += " " + "/".join(extras)
-        if self.tool in (Tool.MOVE, Tool.ROTATE) and self.copies_count > 0:
-            text += f"  ×{self.copies_count}"
         self.tool_label.setText(text)
         self.tool_label.adjustSize()
         vp = self.viewport()
@@ -314,10 +427,10 @@ class PatternCanvas(QGraphicsView):
         if self._panning:
             return
         if self.tool is Tool.MOVE:
-            self.setCursor(Qt.CursorShape.SizeAllCursor)
+            self.viewport().setCursor(Qt.CursorShape.SizeAllCursor)
             return
         if self.tool is Tool.ROTATE:
-            self.setCursor(Qt.CursorShape.CrossCursor)
+            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
             return
         size = 36
         img = QImage(size, size, QImage.Format.Format_ARGB32)
@@ -385,28 +498,33 @@ class PatternCanvas(QGraphicsView):
             hx = hy = int(size / 2)
             if self.tool in (Tool.PENCIL, Tool.XLINE, Tool.BACKSTITCH):
                 hx = hy = int(m - 1)
-            self.setCursor(QCursor(QPixmap.fromImage(img), hx, hy))
+            self.viewport().setCursor(QCursor(QPixmap.fromImage(img), hx, hy))
         else:
-            self.unsetCursor()
+            self.viewport().unsetCursor()
 
     # -- scene management ---------------------------------------------
     def _update_scene_rect(self):
         # center the scene rect on the pattern so scrollbar centering and
         # zoom-out land on the fabric, not the scene origin
-        cx = (self.pattern.width - 1) / 2 * CELL
-        cy = (self.pattern.height - 1) / 2 * CELL
+        cx = self.pattern.width / 2 * CELL
+        cy = self.pattern.height / 2 * CELL
         m = (max(self.pattern.width, self.pattern.height) / 2
              + 2 * MARGIN) * CELL
         self.scene.setSceneRect(cx - m, cy - m, 2 * m, 2 * m)
 
     def pattern_center_scene(self):
-        return QPointF((self.pattern.width - 1) / 2 * CELL,
-                       (self.pattern.height - 1) / 2 * CELL)
+        return QPointF(self.pattern.width / 2 * CELL,
+                       self.pattern.height / 2 * CELL)
 
     def set_pattern(self, pattern: Pattern):
         self.pattern = pattern
         self.selection.clear()
         self._resolve_cache.clear()
+        g = pattern.guides
+        self.guides_h = set(g.get("h", []))
+        self.guides_v = set(g.get("v", []))
+        self.guides_d1 = set(g.get("d1", []))
+        self.guides_d2 = set(g.get("d2", []))
         self._update_scene_rect()
         self.centerOn(self.pattern_center_scene())
         self.viewport().update()
@@ -425,13 +543,23 @@ class PatternCanvas(QGraphicsView):
             return (gx, gy)
         return None
 
+    def cell_index_from_scene(self, pos) -> tuple[int, int] | None:
+        """Cell (floor) containing the scene position — for X stitches,
+        whose a coords are cell indices centered at a+0.5."""
+        p = self.mapToScene(pos)
+        gx = math.floor(p.x() / CELL)
+        gy = math.floor(p.y() / CELL)
+        if 0 <= gx < self.pattern.width and 0 <= gy < self.pattern.height:
+            return (gx, gy)
+        return None
+
     def point_from_scene(self, pos) -> tuple[float, float]:
         p = self.mapToScene(pos)
         return (p.x() / CELL, p.y() / CELL)
 
     # -- block resolution cache ----------------------------------------
     def resolved_stitches(self, inst) -> list[Stitch]:
-        key = (inst.uid, inst.block_id, inst.scope,
+        key = (inst.uid, inst.block_id, inst.scope, inst.layer,
                (inst.transform.m00, inst.transform.m01, inst.transform.m10,
                 inst.transform.m11, inst.transform.tx, inst.transform.ty),
                tuple(sorted(inst.recolor.items())),
@@ -458,8 +586,21 @@ class PatternCanvas(QGraphicsView):
 
     # -- zoom / pan ------------------------------------------------------
     def wheelEvent(self, event: QWheelEvent):
-        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
-        self.zoom_at(event.position().toPoint(), factor)
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+            self.zoom_at(event.position().toPoint(), factor)
+            event.accept()
+            return
+        # plain wheel scrolls the view
+        d = event.pixelDelta()
+        if d.isNull():
+            a = event.angleDelta()
+            d = QPoint(int(a.x() / 3), int(a.y() / 3))
+        self.horizontalScrollBar().setValue(
+            self.horizontalScrollBar().value() - d.x())
+        self.verticalScrollBar().setValue(
+            self.verticalScrollBar().value() - d.y())
+        event.accept()
 
     def scale(self, sx, sy):
         super().scale(sx, sy)
@@ -500,6 +641,11 @@ class PatternCanvas(QGraphicsView):
                 self.viewport().update()
                 event.accept()
                 return
+            if self._guide_move is not None:
+                self._guide_move = None
+                self.viewport().update()
+                event.accept()
+                return
             cleared = False
             if self._poly is not None:
                 self._poly = None
@@ -521,18 +667,23 @@ class PatternCanvas(QGraphicsView):
                 self.place_rot = (self.place_rot + step) % 360
                 self._update_tool_label()
                 self.viewport().update()
+                self.status_message.emit(f"placement rotation: {self.place_rot}°")
                 event.accept()
                 return
             if key == Qt.Key.Key_F:
                 self.place_mx = not self.place_mx
                 self._update_tool_label()
                 self.viewport().update()
+                self.status_message.emit(
+                    f"placement flip horizontal: {'on' if self.place_mx else 'off'}")
                 event.accept()
                 return
             if key == Qt.Key.Key_V:
                 self.place_my = not self.place_my
                 self._update_tool_label()
                 self.viewport().update()
+                self.status_message.emit(
+                    f"placement flip vertical: {'on' if self.place_my else 'off'}")
                 event.accept()
                 return
             num = {Qt.Key.Key_1: 1, Qt.Key.Key_2: 2, Qt.Key.Key_3: 3,
@@ -546,7 +697,7 @@ class PatternCanvas(QGraphicsView):
                 return
         if event.key() == Qt.Key.Key_Space:
             self._panning = True
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
             return
         super().keyPressEvent(event)
@@ -554,7 +705,7 @@ class PatternCanvas(QGraphicsView):
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key.Key_Space:
             self._panning = False
-            self.unsetCursor()
+            self.viewport().unsetCursor()
             self.refresh_cursor()
         super().keyReleaseEvent(event)
 
@@ -566,32 +717,43 @@ class PatternCanvas(QGraphicsView):
             if self.tool is Tool.PAN \
                     and event.button() == Qt.MouseButton.LeftButton:
                 self._panning = True
-                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
             self._pan_start = event.position().toPoint()
             event.accept()
             return
         if event.button() == Qt.MouseButton.RightButton:
-            action_active = (
+            # in-progress action -> commit/cancel it, keep tool active
+            committing = (
                 (self.tool is Tool.BACKSTITCH and self._poly is not None) or
                 self._anchor is not None or
-                (self.tool is Tool.BLOCK and self.pending_block is not None) or
+                self._guide_move is not None or
                 self._move_anchor is not None or
                 self._rot_center is not None)
-            if action_active:
-                # end current action -> back to select tool
+            if committing:
                 if self.tool is Tool.BACKSTITCH and self._poly is not None:
                     self._finish_poly(commit=len(self._poly) >= 2)
                 self._clear_anchor()
+                self._guide_move = None
                 self._move_anchor = self._move_cur = self._move_target = None
                 self._rot_center = self._rot_ref = None
                 self._rot_q = 0
-                if self.tool is Tool.BLOCK:
+                self.viewport().update()
+            elif self.tool is not Tool.SELECT:
+                # nothing in progress -> second right-click exits to Select
+                if self.tool is Tool.BLOCK \
+                        and self.pending_block is not None:
                     self.status_message.emit("block placement ended")
                 self.set_tool(Tool.SELECT)
-            elif self.tool is not Tool.SELECT:
-                self.set_tool(Tool.SELECT)
             else:
-                self.context_menu.emit(event.position().toPoint())
+                # right-click on an item -> MRU menu; on empty -> deselect
+                scene_pt = self.mapToScene(event.position().toPoint())
+                keys, uids = self._items_at_point(scene_pt)
+                if keys or uids:
+                    self.context_menu.emit(event.position().toPoint())
+                elif not self.selection.empty:
+                    self.selection.clear()
+                    self.selection_changed.emit()
+                    self.viewport().update()
             event.accept()
             return
         if event.button() != Qt.MouseButton.LeftButton:
@@ -599,27 +761,35 @@ class PatternCanvas(QGraphicsView):
             return
 
         cell = self.cell_from_scene(event.position().toPoint())
+        xcell = self.cell_index_from_scene(event.position().toPoint())
         scene_pt = self.mapToScene(event.position().toPoint())
         self._press_scene = scene_pt
         self._press_moved = False
 
         if self.tool is Tool.PENCIL:
-            if cell:
-                self._drag_start_cell = cell
-                self._drag_last_cell = cell
+            if xcell:
+                self._drag_start_cell = xcell
+                self._drag_last_cell = xcell
         elif self.tool is Tool.BACKSTITCH:
             gp = (round(scene_pt.x() / CELL), round(scene_pt.y() / CELL))
             self._back_start = gp
             self._press_point = gp
         elif self.tool is Tool.XLINE:
-            if cell:
-                self._press_point = cell
+            if xcell:
+                self._press_point = xcell
         elif self.tool is Tool.ERASER:
-            if cell:
-                self._drag_start_cell = cell
-                self.erase_cells.emit(self._cells_along(cell, cell))
+            if xcell:
+                self._drag_start_cell = xcell
+                self.erase_cells.emit(self._cells_along(xcell, xcell))
         elif self.tool is Tool.SELECT:
-            self._rubber_start = scene_pt
+            hit = None if self.guides_locked else self._guide_at(scene_pt)
+            if hit is not None:
+                # grab a guide to reposition it
+                self._guide_move = {"kind": hit[0], "key": hit[1],
+                                    "cur": hit[1]}
+                self.viewport().update()
+            else:
+                self._rubber_start = scene_pt
         elif self.tool is Tool.BLOCK and self.pending_block is not None:
             if cell:
                 self.place_block.emit(self.pending_block, self.pending_scope,
@@ -633,11 +803,7 @@ class PatternCanvas(QGraphicsView):
                 self._move_anchor = scene_pt
                 self._move_cur = scene_pt
                 self._move_target = None
-                n = self.copies_count
-                self.status_message.emit(
-                    "move: drag or click target"
-                    + (f" ({n} cop{'ies' if n > 1 else 'y'})"
-                       if n > 0 else ""))
+                self.status_message.emit("move: drag or click target")
                 self.viewport().update()
             else:
                 self._move_target = scene_pt
@@ -649,18 +815,19 @@ class PatternCanvas(QGraphicsView):
                 self._rot_center = gp
                 self._rot_ref = None
                 self._rot_q = 0
-                n = self.copies_count
                 self.status_message.emit(
-                    "rotate: press-drag from a point to set the angle"
-                    + (f" ({n} cop{'ies' if n > 1 else 'y'})"
-                       if n > 0 else ""))
+                    "rotate: press-drag from a point to set the angle")
                 self.viewport().update()
             elif self._rot_ref is None:
                 self._rot_ref = scene_pt
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent):
-        cell = self.cell_from_scene(event.position().toPoint())
+        cell_i = self.cell_from_scene(event.position().toPoint())
+        cell_x = self.cell_index_from_scene(event.position().toPoint())
+        # X-stitch tools and the eraser work in cell-index space
+        cell = cell_x if self.tool in (
+            Tool.PENCIL, Tool.XLINE, Tool.ERASER) else cell_i
         self._last_mouse_scene = self.mapToScene(event.position().toPoint())
         # repaint only when the snapped target changes (cheap hover dot)
         sp = self._last_mouse_scene
@@ -678,9 +845,23 @@ class PatternCanvas(QGraphicsView):
             if abs(d.x()) > CELL * 0.4 or abs(d.y()) > CELL * 0.4:
                 self._press_moved = True
         if self.tool in (Tool.BACKSTITCH, Tool.XLINE):
-            self._back_current = (
-                round(self._last_mouse_scene.x() / CELL),
-                round(self._last_mouse_scene.y() / CELL))
+            if self.tool is Tool.XLINE:
+                self._back_current = (
+                    math.floor(self._last_mouse_scene.x() / CELL),
+                    math.floor(self._last_mouse_scene.y() / CELL))
+            else:
+                self._back_current = (
+                    round(self._last_mouse_scene.x() / CELL),
+                    round(self._last_mouse_scene.y() / CELL))
+
+        if self._guide_move is not None:
+            px = self._last_mouse_scene.x() / CELL
+            py = self._last_mouse_scene.y() / CELL
+            self._guide_move["cur"] = self._guide_snapped(
+                self._guide_move["kind"], px, py)
+            self.viewport().update()
+            super().mouseMoveEvent(event)
+            return
 
         if self._pan_start is not None and (
                 event.buttons() & Qt.MouseButton.MiddleButton or self._panning):
@@ -729,12 +910,28 @@ class PatternCanvas(QGraphicsView):
             self.refresh_cursor()
             event.accept()
             return
+        if self._guide_move is not None \
+                and event.button() == Qt.MouseButton.LeftButton:
+            gm = self._guide_move
+            self._guide_move = None
+            store = {"h": self.guides_h, "v": self.guides_v,
+                     "d1": self.guides_d1,
+                     "d2": self.guides_d2}[gm["kind"]]
+            store.discard(gm["key"])
+            store.add(gm["cur"])
+            self._sync_guides()
+            self.viewport().update()
+            event.accept()
+            return
         if event.button() != Qt.MouseButton.LeftButton:
             super().mouseReleaseEvent(event)
             return
 
         scene_pt = self.mapToScene(event.position().toPoint())
-        cell = self.cell_from_scene(event.position().toPoint())
+        cell_i = self.cell_from_scene(event.position().toPoint())
+        cell_x = self.cell_index_from_scene(event.position().toPoint())
+        cell = cell_x if self.tool in (
+            Tool.PENCIL, Tool.XLINE, Tool.ERASER) else cell_i
         moved = self._press_moved
         self._press_scene = None
         self._press_moved = False
@@ -791,9 +988,9 @@ class PatternCanvas(QGraphicsView):
         elif self.tool is Tool.ROTATE:
             self._commit_rotate()
         elif self.tool is Tool.SELECT and self._rubber_start is not None:
-            if not moved and cell is not None:
+            if not moved:
                 self._click_select(
-                    cell, additive=bool(
+                    scene_pt, additive=bool(
                         event.modifiers()
                         & Qt.KeyboardModifier.ShiftModifier))
             else:
@@ -831,6 +1028,82 @@ class PatternCanvas(QGraphicsView):
                 xs.append(px); ys.append(py)
         return min(xs), min(ys), max(xs), max(ys)
 
+    # -- guides ------------------------------------------------------------
+    @staticmethod
+    def _guide_key(orient, gx, gy, kind):
+        """Map a ruler drag to (storage kind, snapped value)."""
+        if kind == 1:    # "/" family: y = x + c  ->  c = y - x
+            return "d1", gy - gx
+        if kind == 2:    # "\" family: y = -x + c ->  c = y + x
+            return "d2", gy + gx
+        if orient is Qt.Orientation.Horizontal:
+            return "h", gy
+        return "v", gx
+
+    def guide_dragging(self, orient, gx, gy, kind):
+        self._guide_drag = self._guide_key(orient, gx, gy, kind)
+        self.viewport().update()
+
+    def guide_dropped(self, orient, gx, gy, kind):
+        self._guide_drag = None
+        gkind, val = self._guide_key(orient, gx, gy, kind)
+        store = {"h": self.guides_h, "v": self.guides_v,
+                 "d1": self.guides_d1, "d2": self.guides_d2}[gkind]
+        store.add(val)
+        self._sync_guides()
+        self.viewport().update()
+
+    def _sync_guides(self):
+        """Write guide sets back to pattern.guides for persistence."""
+        g = self.pattern.guides
+        g["h"] = sorted(self.guides_h)
+        g["v"] = sorted(self.guides_v)
+        g["d1"] = sorted(self.guides_d1)
+        g["d2"] = sorted(self.guides_d2)
+        self.guides_changed.emit()
+
+    def clear_guides(self):
+        self.guides_h.clear()
+        self.guides_v.clear()
+        self.guides_d1.clear()
+        self.guides_d2.clear()
+        self._sync_guides()
+        self.viewport().update()
+
+    # -- guide hit-testing / editing ---------------------------------------
+    def _guide_at(self, scene_pt):
+        """Nearest guide within ~6px of the scene point, or None."""
+        px, py = scene_pt.x() / CELL, scene_pt.y() / CELL
+        best = None
+        best_d = 0.3  # cell units (~6px)
+        for gy in self.guides_h:
+            d = abs(py - gy)
+            if d < best_d:
+                best, best_d = ("h", gy), d
+        for gx in self.guides_v:
+            d = abs(px - gx)
+            if d < best_d:
+                best, best_d = ("v", gx), d
+        import math
+        for cc in self.guides_d1:
+            d = abs(py - px - cc) / math.sqrt(2)
+            if d < best_d:
+                best, best_d = ("d1", cc), d
+        for cc in self.guides_d2:
+            d = abs(py + px - cc) / math.sqrt(2)
+            if d < best_d:
+                best, best_d = ("d2", cc), d
+        return best
+
+    def _guide_snapped(self, kind, px, py):
+        if kind == "h":
+            return int(round(py))
+        if kind == "v":
+            return int(round(px))
+        if kind == "d1":
+            return int(round(py - px))
+        return int(round(py + px))  # d2
+
     # -- move / rotate tools ----------------------------------------------
     def _selection_bbox(self):
         """Cell-space bbox of selected stitches + instances, or None."""
@@ -838,9 +1111,8 @@ class PatternCanvas(QGraphicsView):
         for k in self.selection.stitch_keys:
             s = self.pattern.stitches.get(k)
             if s:
-                xs.append(s.a[0]); ys.append(s.a[1])
-                if s.b:
-                    xs.append(s.b[0]); ys.append(s.b[1])
+                for px, py in s.extent_points():
+                    xs.append(px); ys.append(py)
         for inst in self.pattern.instances:
             if inst.uid in self.selection.instance_uids:
                 bb = inst.resolved_bbox(self.pattern.blocks,
@@ -882,7 +1154,7 @@ class PatternCanvas(QGraphicsView):
         if dx == 0 and dy == 0:
             self.viewport().update()
             return
-        self.move_selection.emit(dx, dy, self.copies_count)
+        self.move_selection.emit(dx, dy)
         self.viewport().update()
 
     def _commit_rotate(self):
@@ -890,8 +1162,7 @@ class PatternCanvas(QGraphicsView):
             return
         if self._rot_ref is not None and self._rot_q:
             cx, cy = self._rot_center
-            self.rotate_selection.emit(cx, cy, self._rot_q,
-                                       self.copies_count)
+            self.rotate_selection.emit(cx, cy, self._rot_q)
         # q == 0 or no drag: keep center armed for another attempt
         if self._rot_q == 0:
             self._rot_ref = None
@@ -920,13 +1191,13 @@ class PatternCanvas(QGraphicsView):
                 for k in range(width):
                     off = k - (width - 1) / 2.0
                     cells |= self._cells_along_float(
-                        a_cell[0] + nx * off, a_cell[1] + ny * off,
-                        b_cell[0] + nx * off, b_cell[1] + ny * off)
+                        a_cell[0] + 0.5 + nx * off, a_cell[1] + 0.5 + ny * off,
+                        b_cell[0] + 0.5 + nx * off, b_cell[1] + 0.5 + ny * off)
         stitches = [Stitch(StitchKind.X, c, None, self.current_color)
                     for c in sorted(cells)]
         stitches = apply_symmetry(stitches, self.symmetry_axes,
                                   self.pattern.width, self.pattern.height)
-        self.draw_stitches.emit(stitches)
+        self._emit_with_layer(stitches)
 
     @staticmethod
     def _backline_stitches(a_pt, b_pt, color) -> list:
@@ -950,7 +1221,7 @@ class PatternCanvas(QGraphicsView):
         stitches = self._backline_stitches(a_pt, b_pt, self.current_color)
         stitches = apply_symmetry(stitches, self.symmetry_axes,
                                   self.pattern.width, self.pattern.height)
-        self.draw_stitches.emit(stitches)
+        self._emit_with_layer(stitches)
 
     def _finish_poly(self, commit: bool):
         """Right-click on backstitch tool: commit (>=2 pts) or cancel."""
@@ -963,7 +1234,7 @@ class PatternCanvas(QGraphicsView):
                         self._backline_stitches(a, b, self.current_color))
             stitches = apply_symmetry(stitches, self.symmetry_axes,
                                       self.pattern.width, self.pattern.height)
-            self.draw_stitches.emit(stitches)
+            self._emit_with_layer(stitches)
             self.status_message.emit(f"polyline committed ({len(self._poly)} points)")
         else:
             self.status_message.emit("polyline cancelled")
@@ -975,38 +1246,84 @@ class PatternCanvas(QGraphicsView):
         s = Stitch(StitchKind.X, cell, None, self.current_color)
         stitches = apply_symmetry([s], self.symmetry_axes,
                                   self.pattern.width, self.pattern.height)
+        self._emit_with_layer(stitches)
+
+    def _emit_with_layer(self, stitches):
+        """Tag new stitches with the pattern's active layer, then emit."""
+        lyr = self.pattern.active_layer
+        if any(s.layer != lyr for s in stitches):
+            from dataclasses import replace
+            stitches = [replace(s, layer=lyr) for s in stitches]
         self.draw_stitches.emit(stitches)
 
     def _cells_along(self, a, b) -> set:
-        """Cells on the line between grid cells a and b (Bresenham-ish)."""
-        return self._cells_along_float(a[0], a[1], b[0], b[1])
+        """Cells on the line between cell indices a and b.
+
+        Samples in center space (index + 0.5) so floor() yields the
+        cells the drawn line actually passes through."""
+        return self._cells_along_float(a[0] + 0.5, a[1] + 0.5,
+                                       b[0] + 0.5, b[1] + 0.5)
 
     @staticmethod
     def _cells_along_float(x0, y0, x1, y1, step=0.5) -> set:
-        """Integer lattice points sampled along a (possibly fractional) line."""
+        """Cell indices sampled along a (possibly fractional) line."""
         cells = set()
         dist = max(abs(x1 - x0), abs(y1 - y0), step)
         n = max(int(dist / step) + 1, 2)
         for i in range(n + 1):
             t = i / n
-            cells.add((int(round(x0 + (x1 - x0) * t)),
-                       int(round(y0 + (y1 - y0) * t))))
+            cells.add((math.floor(x0 + (x1 - x0) * t),
+                       math.floor(y0 + (y1 - y0) * t)))
         return cells
 
-    def _items_at_cell(self, cell):
-        """(stitch keys, instance uids) touching a grid cell."""
-        keys = {s.key for s in self.pattern.get_stitches_in_cell(cell)}
-        uids = set()
-        for inst in self.pattern.instances:
-            for s in self.resolved_stitches(inst):
-                if cell in s.cells():
-                    uids.add(inst.uid)
-                    break
-        return keys, uids
+    def _stitch_hit_dist(self, s: Stitch, px, py):
+        """Distance in cells from point to stitch extent, or None.
 
-    def _click_select(self, cell, additive=False):
-        """Click-select: plain replaces selection, Shift toggles items."""
-        keys, uids = self._items_at_cell(cell)
+        X stitches hit within ~0.6 cells of their intersection (covers
+        the arms); backstitches hit within ~0.4 cells of the segment.
+        """
+        if s.kind is StitchKind.X:
+            # X occupies cell [a, a+1] centered at a+0.5
+            cx, cy = s.a[0] + 0.5, s.a[1] + 0.5
+            d = max(abs(px - cx), abs(py - cy))
+            return d if d <= 0.6 else None
+        pa, pb = s.endpoints()
+        d = self._dist_to_seg(px, py, pa, pb)
+        return d if d <= 0.4 else None
+
+    def _items_at_point(self, scene_pt):
+        """Nearest (stitch key | instance uid) under the scene point."""
+        px, py = scene_pt.x() / CELL, scene_pt.y() / CELL
+        p = self.pattern
+        best = None
+        best_d = 1e9
+        for s in p.stitches.values():
+            if p.layer_locked(s.layer) or not p.layer_visible(s.layer):
+                continue
+            d = self._stitch_hit_dist(s, px, py)
+            if d is not None and d < best_d:
+                best, best_d = ("s", s.key), d
+        for inst in p.instances:
+            if inst.layer and (p.layer_locked(inst.layer)
+                               or not p.layer_visible(inst.layer)):
+                continue
+            for s in self.resolved_stitches(inst):
+                if not p.layer_visible(s.layer) \
+                        or p.layer_locked(s.layer):
+                    continue
+                d = self._stitch_hit_dist(s, px, py)
+                if d is not None and d < best_d:
+                    best, best_d = ("i", inst.uid), d
+                    break
+        if best is None:
+            return set(), set()
+        if best[0] == "s":
+            return {best[1]}, set()
+        return set(), {best[1]}
+
+    def _click_select(self, scene_pt, additive=False):
+        """Click-select nearest segment: plain replaces, Shift toggles."""
+        keys, uids = self._items_at_point(scene_pt)
         if additive:
             for k in keys:
                 if k in self.selection.stitch_keys:
@@ -1037,14 +1354,15 @@ class PatternCanvas(QGraphicsView):
     def _stitch_cover(self, s: Stitch, x0, y0, x1, y1) -> float:
         """Fraction of stitch s's extent inside cell-space rect."""
         if s.kind is StitchKind.X:
-            # X occupies the unit cell centered on its intersection
-            return (self._frac_inside_1d(s.a[0] - 0.5, s.a[0] + 0.5, x0, x1)
-                    * self._frac_inside_1d(s.a[1] - 0.5, s.a[1] + 0.5, y0, y1))
-        # backstitch: parametric fraction of the segment inside the rect
+            # X occupies the unit cell [a, a+1] x [a1, a1+1]
+            return (self._frac_inside_1d(s.a[0], s.a[0] + 1, x0, x1)
+                    * self._frac_inside_1d(s.a[1], s.a[1] + 1, y0, y1))
+        # backstitch: parametric fraction of the drawn (trimmed) segment
+        # inside the rect; t runs along full a->b, clipped to [ta, tb]
         ax, ay = s.a
         bx, by = s.b
         dx, dy = bx - ax, by - ay
-        t0, t1 = 0.0, 1.0
+        t0, t1 = s.ta, s.tb
         for p, d, lo, hi in ((ax, dx, x0, x1), (ay, dy, y0, y1)):
             if d == 0:
                 if p < lo or p > hi:
@@ -1055,7 +1373,7 @@ class PatternCanvas(QGraphicsView):
             t1 = min(t1, max(ta, tb))
             if t0 >= t1:
                 return 0.0
-        return t1 - t0
+        return (t1 - t0) / (s.tb - s.ta)
 
     def _finish_rubber(self, scene_pt):
         """Convert rubber-band rect (scene coords) to a selection.
@@ -1069,12 +1387,20 @@ class PatternCanvas(QGraphicsView):
         x0, x1 = sorted([a.x() / CELL, b.x() / CELL])
         y0, y1 = sorted([a.y() / CELL, b.y() / CELL])
         cov = self.SELECT_COVERAGE
+        p = self.pattern
         self.selection.stitch_keys = {
-            s.key for s in self.pattern.stitches.values()
-            if self._stitch_cover(s, x0, y0, x1, y1) >= cov}
+            s.key for s in p.stitches.values()
+            if not p.layer_locked(s.layer)
+            and p.layer_visible(s.layer)
+            and self._stitch_cover(s, x0, y0, x1, y1) >= cov}
         self.selection.instance_uids = set()
-        for inst in self.pattern.instances:
-            sts = self.resolved_stitches(inst)
+        for inst in p.instances:
+            if inst.layer and (p.layer_locked(inst.layer)
+                               or not p.layer_visible(inst.layer)):
+                continue
+            sts = [s for s in self.resolved_stitches(inst)
+                   if not p.layer_locked(s.layer)
+                   and p.layer_visible(s.layer)]
             if sts:
                 hits = sum(1 for s in sts
                            if self._stitch_cover(s, x0, y0, x1, y1) >= cov)
@@ -1094,6 +1420,98 @@ class PatternCanvas(QGraphicsView):
         t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / l2))
         return ((px - (ax + t * dx)) ** 2 + (py - (ay + t * dy)) ** 2) ** 0.5
 
+    def _ghost_strokes(self):
+        """Selected stitches transformed by the pending move/rotate.
+
+        Returns list of (kind, a, b, color_spec) in cell coords, or [].
+        """
+        dx = dy = 0
+        rot = None  # (cx, cy, q)
+        if self.tool is Tool.MOVE and self._move_anchor is not None:
+            end = self._move_target if self._move_target is not None \
+                else self._move_cur
+            if end is None:
+                return []
+            dx = int(round((end.x() - self._move_anchor.x()) / CELL))
+            dy = int(round((end.y() - self._move_anchor.y()) / CELL))
+            if dx == 0 and dy == 0:
+                return []
+        elif self.tool is Tool.ROTATE and self._rot_center is not None \
+                and self._rot_q:
+            rot = (self._rot_center[0], self._rot_center[1], self._rot_q)
+        else:
+            return []
+
+        def xf(p):
+            x, y = p[0] + dx, p[1] + dy
+            if rot:
+                cx, cy, q = rot
+                ddx, ddy = x - cx, y - cy
+                for _ in range(q):
+                    ddx, ddy = -ddy, ddx
+                x, y = cx + ddx, cy + ddy
+            return (x, y)
+
+        out = []
+        for k in self.selection.stitch_keys:
+            s = self.pattern.stitches.get(k)
+            if s:
+                out.append((s.kind, xf(s.a),
+                            xf(s.b) if s.b else None, s.color,
+                            s.ta, s.tb))
+        for inst in self.pattern.instances:
+            if inst.uid not in self.selection.instance_uids:
+                continue
+            for s in self.resolved_stitches(inst):
+                out.append((s.kind, xf(s.a),
+                            xf(s.b) if s.b else None,
+                            self.instance_color(inst, s.color),
+                            s.ta, s.tb))
+        return out
+
+    def _draw_ghost_strokes(self, painter: QPainter, strokes):
+        for kind, a, b, color, ta, tb in strokes:
+            col = QColor(palette.resolve(color))
+            col.setAlpha(80)
+            pen = QPen(col, max(1.2, CELL * 0.16))
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            if kind is StitchKind.X:
+                cx, cy = (a[0] + 0.5) * CELL, (a[1] + 0.5) * CELL
+                h = CELL * 0.5
+                painter.drawLine(cx - h, cy - h, cx + h, cy + h)
+                painter.drawLine(cx + h, cy - h, cx - h, cy + h)
+            else:
+                pa = (a[0] + (b[0] - a[0]) * ta, a[1] + (b[1] - a[1]) * ta)
+                pb = (a[0] + (b[0] - a[0]) * tb, a[1] + (b[1] - a[1]) * tb)
+                painter.drawLine(pa[0] * CELL, pa[1] * CELL,
+                                 pb[0] * CELL, pb[1] * CELL)
+
+    def _draw_transform_ghost(self, painter: QPainter):
+        """Paint selected stitches ghosted at their pending transform."""
+        self._draw_ghost_strokes(painter, self._ghost_strokes())
+
+    def _block_ghost_strokes(self):
+        """Pending block's resolved stitches at the ghost position."""
+        if self.pending_block is None or self._ghost_cell is None:
+            return []
+        bb = self.pending_block.bbox()
+        if not bb:
+            return []
+        gx, gy = self._ghost_cell
+        ax, ay = self._block_anchor(bb)
+        ax, ay = int(round(ax)), int(round(ay))
+        inner = Transform.from_semantic(0, 0, self.place_rot,
+                                        self.place_mx, self.place_my)
+        local = (Transform.translation(-ax, -ay)
+                 .then(inner)
+                 .then(Transform.translation(ax, ay)))
+        t = local.then(Transform.translation(gx - ax, gy - ay))
+        reg = {**self.pattern.blocks, **self.library_blocks}
+        return [(s.kind, s.a, s.b, s.color, s.ta, s.tb)
+                for s in self.pending_block.resolved_stitches(
+                    t, registry=reg)]
+
     def _draw_eraser_highlight(self, painter: QPainter):
         """Highlight stitches the eraser would remove at the cursor."""
         sp = self._last_mouse_scene
@@ -1101,10 +1519,13 @@ class PatternCanvas(QGraphicsView):
         gy = sp.y() / CELL
         hits = []
         for s in self.pattern.stitches.values():
+            if self.pattern.layer_locked(s.layer) \
+                    or not self.pattern.layer_visible(s.layer):
+                continue
             if s.kind is StitchKind.X:
                 if abs(gx - s.a[0]) < 0.5 and abs(gy - s.a[1]) < 0.5:
                     hits.append(s)
-            elif self._dist_to_seg(gx, gy, s.a, s.b) <= 0.6:
+            elif self._dist_to_seg(gx, gy, *s.endpoints()) <= 0.6:
                 hits.append(s)
         if not hits:
             return
@@ -1115,26 +1536,68 @@ class PatternCanvas(QGraphicsView):
         painter.setPen(pen)
         for s in hits:
             if s.kind is StitchKind.X:
-                cx, cy = s.a[0] * CELL, s.a[1] * CELL
+                cx, cy = (s.a[0] + 0.5) * CELL, (s.a[1] + 0.5) * CELL
                 h = CELL * 0.46
                 painter.drawLine(cx - h, cy - h, cx + h, cy + h)
                 painter.drawLine(cx + h, cy - h, cx - h, cy + h)
             else:
-                painter.drawLine(s.a[0] * CELL, s.a[1] * CELL,
-                                 s.b[0] * CELL, s.b[1] * CELL)
+                pa, pb = s.endpoints()
+                painter.drawLine(pa[0] * CELL, pa[1] * CELL,
+                                 pb[0] * CELL, pb[1] * CELL)
+
+    def _draw_symmetry_axes(self, painter: QPainter):
+        """Overlay showing active symmetry modes and their axes."""
+        axes = self.symmetry_axes
+        if not axes:
+            return
+        p = self.pattern
+        w, h = p.width, p.height
+        col = QColor("#9944ff")
+        col.setAlpha(140)
+        pen = QPen(col, 1.4, Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        x0, y0 = 0.0, 0.0
+        x1, y1 = w * CELL, h * CELL
+        if "h" in axes:
+            xm = w * CELL / 2
+            painter.drawLine(xm, y0, xm, y1)
+            painter.drawText(xm + 4, y0 + 12, "H")
+        if "v" in axes:
+            ym = h * CELL / 2
+            painter.drawLine(x0, ym, x1, ym)
+            painter.drawText(x0 + 4, ym - 4, "V")
+        if "d" in axes:
+            m = min(w, h) * CELL
+            painter.drawLine(x0, y0, m, m)
+            painter.drawText(m - 14, m - 6, "D")
+        if "ad" in axes:
+            # point mirror: mark the center
+            cx, cy = w * CELL / 2, h * CELL / 2
+            painter.drawLine(cx - 8, cy, cx + 8, cy)
+            painter.drawLine(cx, cy - 8, cx, cy + 8)
+            painter.drawText(cx + 8, cy - 6, "180")
 
     def drawForeground(self, painter: QPainter, rect):
+        self._draw_symmetry_axes(painter)
         # snap indicator: dot on the grid intersection a click would hit
         if self.tool not in (Tool.PAN, Tool.BLOCK, Tool.ERASER) and \
                 getattr(self, "_last_mouse_scene", None) is not None:
             sp = self._last_mouse_scene
-            gx = int(round(sp.x() / CELL))
-            gy = int(round(sp.y() / CELL))
             p = self.pattern
-            if self.tool is Tool.BACKSTITCH:
-                ok = 0 <= gx <= p.width and 0 <= gy <= p.height
-            else:
+            if self.tool in (Tool.PENCIL, Tool.XLINE):
+                # X tools snap to cell centers
+                gx = math.floor(sp.x() / CELL)
+                gy = math.floor(sp.y() / CELL)
                 ok = 0 <= gx < p.width and 0 <= gy < p.height
+                px, py = (gx + 0.5) * CELL, (gy + 0.5) * CELL
+            else:
+                gx = int(round(sp.x() / CELL))
+                gy = int(round(sp.y() / CELL))
+                if self.tool is Tool.BACKSTITCH:
+                    ok = 0 <= gx <= p.width and 0 <= gy <= p.height
+                else:
+                    ok = 0 <= gx < p.width and 0 <= gy < p.height
+                px, py = gx * CELL, gy * CELL
             if ok:
                 col = QColor(self.current_color) if self.tool in (
                     Tool.PENCIL, Tool.XLINE, Tool.BACKSTITCH) else \
@@ -1142,7 +1605,7 @@ class PatternCanvas(QGraphicsView):
                 col.setAlpha(200)
                 painter.setPen(QPen(QColor("white"), 1.2))
                 painter.setBrush(col)
-                painter.drawEllipse(QRectF(gx * CELL - 4, gy * CELL - 4, 8, 8))
+                painter.drawEllipse(QRectF(px - 4, py - 4, 8, 8))
 
         if self._rubber_start is not None:
             end = getattr(self, "_last_mouse_scene", self._rubber_start)
@@ -1153,73 +1616,37 @@ class PatternCanvas(QGraphicsView):
         if self.tool is Tool.BLOCK and self.pending_block is not None \
                 and getattr(self, "_ghost_cell", None):
             gx, gy = self._ghost_cell
-            bb = self.pending_block.bbox()
-            painter.setPen(QPen(QColor("#2266ff"), 1.5, Qt.PenStyle.DashLine))
-            if bb:
-                rbb = self._ghost_bbox(bb)
-                ax, ay = self._block_anchor(bb)
-                tx, ty = gx - ax, gy - ay
-                # rect spans half a cell beyond the outer stitch points so
-                # the outline is centered on the stitch lattice
-                w = (rbb[2] - rbb[0] + 1) * CELL
-                h = (rbb[3] - rbb[1] + 1) * CELL
-                painter.drawRect(QRectF((rbb[0] - 0.5 + tx) * CELL,
-                                        (rbb[1] - 0.5 + ty) * CELL, w, h))
-                # anchor cross at insertion point
-                painter.setPen(QPen(QColor("#ff5522"), 1.5))
-                painter.drawLine(gx * CELL - 6, gy * CELL, gx * CELL + 6, gy * CELL)
-                painter.drawLine(gx * CELL, gy * CELL - 6, gx * CELL, gy * CELL + 6)
+            # ghosted block stitches at the exact pending transform
+            self._draw_ghost_strokes(painter, self._block_ghost_strokes())
+            # anchor cross at insertion point
+            painter.setPen(QPen(QColor("#ff5522"), 1.5))
+            painter.drawLine(gx * CELL - 6, gy * CELL, gx * CELL + 6, gy * CELL)
+            painter.drawLine(gx * CELL, gy * CELL - 6, gx * CELL, gy * CELL + 6)
         # eraser: highlight the stitch/segment that would be removed
         if self.tool is Tool.ERASER and \
                 getattr(self, "_last_mouse_scene", None) is not None:
             self._draw_eraser_highlight(painter)
 
-        # move tool: ghost of selection bbox at drag offset
+        # move/rotate ghost: actual selected stitches at pending transform
+        self._draw_transform_ghost(painter)
+        # move tool: anchor marker
         if self.tool is Tool.MOVE and self._move_anchor is not None:
-            end = self._move_target if self._move_target is not None \
-                else self._move_cur
-            bb = self._selection_bbox()
-            if end is not None and bb:
-                dx = (end.x() - self._move_anchor.x()) / CELL
-                dy = (end.y() - self._move_anchor.y()) / CELL
-                painter.setPen(QPen(QColor("#22aa55"), 1.5,
-                                    Qt.PenStyle.DashLine))
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawRect(QRectF(
-                    (bb[0] - 0.5 + dx) * CELL, (bb[1] - 0.5 + dy) * CELL,
-                    (bb[2] - bb[0] + 1) * CELL, (bb[3] - bb[1] + 1) * CELL))
-                painter.setBrush(QColor("#22aa55"))
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.drawEllipse(QRectF(self._move_anchor.x() - 4,
-                                           self._move_anchor.y() - 4, 8, 8))
+            painter.setBrush(QColor("#22aa55"))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QRectF(self._move_anchor.x() - 4,
+                                       self._move_anchor.y() - 4, 8, 8))
 
-        # rotate tool: center marker + rotated bbox preview
+        # rotate tool: center marker + sweep line
         if self.tool is Tool.ROTATE and self._rot_center is not None:
             cx, cy = self._rot_center
             ccx, ccy = cx * CELL, cy * CELL
             painter.setPen(QPen(QColor("#ff8833"), 1.5))
             painter.drawLine(ccx - 7, ccy, ccx + 7, ccy)
             painter.drawLine(ccx, ccy - 7, ccx, ccy + 7)
-            bb = self._selection_bbox()
-            if bb:
-                corners = [(bb[0], bb[1]), (bb[2], bb[1]),
-                           (bb[2], bb[3]), (bb[0], bb[3])]
-                pts = []
-                for x, y in corners:
-                    ddx, ddy = x - cx, y - cy
-                    for _ in range(self._rot_q):
-                        ddx, ddy = -ddy, ddx
-                    pts.append(((cx + ddx) * CELL, (cy + ddy) * CELL))
-                painter.setPen(QPen(QColor("#ff8833"), 1.5,
-                                    Qt.PenStyle.DashLine))
-                for i in range(4):
-                    x1, y1 = pts[i]
-                    x2, y2 = pts[(i + 1) % 4]
-                    painter.drawLine(x1, y1, x2, y2)
-                if self._rot_ref is not None:
-                    cur = self._last_mouse_scene
-                    painter.setPen(QPen(QColor("#ff8833"), 1))
-                    painter.drawLine(ccx, ccy, cur.x(), cur.y())
+            if self._rot_ref is not None:
+                cur = self._last_mouse_scene
+                painter.setPen(QPen(QColor("#ff8833"), 1))
+                painter.drawLine(ccx, ccy, cur.x(), cur.y())
 
         # backstitch polyline preview
         if self.tool is Tool.BACKSTITCH and self._poly:
@@ -1253,7 +1680,7 @@ class PatternCanvas(QGraphicsView):
                     # X-line preview: cells along anchor->cursor
                     b_cell = (int(cur.x() // CELL), int(cur.y() // CELL))
                     for c in self._cells_along(a, b_cell):
-                        cx, cy = c[0] * CELL, c[1] * CELL
+                        cx, cy = (c[0] + 0.5) * CELL, (c[1] + 0.5) * CELL
                         h = CELL * 0.42
                         painter.setPen(QPen(QColor(self.current_color), 1.2,
                                             Qt.PenStyle.DashLine))
@@ -1261,8 +1688,8 @@ class PatternCanvas(QGraphicsView):
                         painter.drawLine(cx + h, cy - h, cx - h, cy + h)
             # anchor marker
             kind, a = self._anchor
-            ax, ay = (a[0] * CELL, a[1] * CELL) if kind == "x" else \
-                     (a[0] * CELL, a[1] * CELL)
+            ax = (a[0] + 0.5) * CELL if kind == "x" else a[0] * CELL
+            ay = (a[1] + 0.5) * CELL if kind == "x" else a[1] * CELL
             painter.setPen(QPen(QColor("#2266ff"), 1.5))
             painter.setBrush(QColor(34, 102, 255, 60))
             painter.drawEllipse(QRectF(ax - 4, ay - 4, 8, 8))

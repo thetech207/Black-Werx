@@ -11,7 +11,7 @@ from __future__ import annotations
 import enum
 import itertools
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 
 class StitchKind(enum.Enum):
@@ -36,16 +36,30 @@ class Stitch:
     a: tuple[int, int]
     b: tuple[int, int] | None
     color: str  # color spec: "#rrggbb" or "dmc:NNN" — resolved via palette
+    layer: str = "layer1"  # id of the Pattern layer this stitch lives on
+    ta: float = 0.0   # backstitch: fraction along a->b where drawing starts
+    tb: float = 1.0   # backstitch: fraction along a->b where drawing ends
 
     def __post_init__(self):
         object.__setattr__(self, "a", _norm_point(self.a))
+        ta, tb = float(self.ta), float(self.tb)
         if self.b is not None:
             p = _norm_point(self.b)
             pa, pb = self.a, p
-            if pb < pa:
+            swapped = pb < pa
+            if swapped:
                 pa, pb = pb, pa
+                # endpoint order flipped: fractions invert too
+                ta, tb = 1.0 - tb, 1.0 - ta
             object.__setattr__(self, "a", pa)
             object.__setattr__(self, "b", pb)
+        if self.kind is StitchKind.BACK:
+            if not (0.0 <= ta < tb <= 1.0):
+                raise ValueError(f"invalid backstitch trims: {ta}, {tb}")
+        else:
+            ta, tb = 0.0, 1.0
+        object.__setattr__(self, "ta", ta)
+        object.__setattr__(self, "tb", tb)
         if self.kind is StitchKind.X and self.b is not None:
             raise ValueError("X stitch must not have two endpoints")
         if self.kind is StitchKind.BACK and self.b is None:
@@ -53,13 +67,36 @@ class Stitch:
 
     @property
     def key(self) -> tuple:
-        return (self.kind.value, self.a, self.b)
+        return (self.kind.value, self.a, self.b, self.layer,
+                round(self.ta, 6), round(self.tb, 6))
+
+    def endpoints(self):
+        """Actual drawn endpoints as float cell coords ((x,y)|None).
+
+        X stitches return their cell center; backstitches return the
+        trimmed span endpoints.
+        """
+        if self.kind is StitchKind.X or self.b is None:
+            return (self.a[0] + 0.5, self.a[1] + 0.5), None
+        ax, ay = self.a
+        bx, by = self.b
+        return ((ax + (bx - ax) * self.ta, ay + (by - ay) * self.ta),
+                (ax + (bx - ax) * self.tb, ay + (by - ay) * self.tb))
+
+    def extent_points(self):
+        """All points needed to bound this stitch's drawn area."""
+        if self.kind is StitchKind.X:
+            return [(self.a[0], self.a[1]),
+                    (self.a[0] + 1, self.a[1] + 1)]
+        pa, pb = self.endpoints()
+        return [p for p in (pa, pb) if p is not None]
 
     def cells(self) -> list[tuple[int, int]]:
         """Grid cells this stitch touches (for hit-testing / bounds)."""
         if self.kind is StitchKind.X:
             return [self.a]
-        (x1, y1), (x2, y2) = self.a, self.b
+        pa, pb = self.endpoints()
+        (x1, y1), (x2, y2) = pa, pb
         cells = []
         # walk the line and collect cells it passes through
         steps = max(abs(x2 - x1), abs(y2 - y1), 1)
@@ -84,6 +121,9 @@ class Stitch:
         }
         if self.b is not None:
             d["b"] = list(self.b)
+        d["layer"] = self.layer
+        if self.kind is StitchKind.BACK and (self.ta != 0.0 or self.tb != 1.0):
+            d["ta"], d["tb"] = self.ta, self.tb
         return d
 
     @staticmethod
@@ -93,6 +133,9 @@ class Stitch:
             a=tuple(d["a"]),
             b=tuple(d["b"]) if d.get("b") is not None else None,
             color=d.get("color", "#000000"),
+            layer=d.get("layer", "layer1"),
+            ta=d.get("ta", 0.0),
+            tb=d.get("tb", 1.0),
         )
 
 
@@ -206,6 +249,28 @@ class Transform:
         return f"Transform({self.m00},{self.m01},{self.m10},{self.m11},{self.tx},{self.ty})"
 
 
+def transform_stitch(s: Stitch, t: "Transform") -> Stitch:
+    """Apply affine ``t`` to a stitch, kind-aware.
+
+    X stitches occupy a unit cell, so the transform is applied to the
+    cell's four corners and the image cell index is the min corner —
+    treating the index as a plain point would be off by one cell under
+    rotations/mirrors. Backstitches transform their endpoints; Stitch's
+    normalization keeps a <= b and inverts trims when endpoints swap.
+    """
+    if s.kind is StitchKind.X:
+        i, j = s.a
+        xs, ys = [], []
+        for cx in (i, i + 1):
+            for cy in (j, j + 1):
+                px, py = t.apply((cx, cy))
+                xs.append(px)
+                ys.append(py)
+        return replace(s, a=(min(xs), min(ys)))
+    return replace(s, a=t.apply(s.a),
+                   b=t.apply(s.b) if s.b else None)
+
+
 Transform.IDENTITY = Transform()
 
 
@@ -224,6 +289,36 @@ class Pattern:
     instances: list = field(default_factory=list)  # list[BlockInstance]
     blocks: dict = field(default_factory=dict)      # project-embedded blocks {id: Block}
     threads: dict = field(default_factory=dict)     # thread usage stats cache
+    # view guides: h/v = cell coord, d1 = y-x, d2 = y+x
+    guides: dict = field(default_factory=lambda: {
+        "h": [], "v": [], "d1": [], "d2": []})
+    # layers: ordered list of {"id","name","visible","locked","color"};
+    # later entries draw on top. ``color`` is an optional view-only
+    # display override (does not change the stitch's thread color).
+    layers: list = field(default_factory=lambda: [
+        {"id": "layer1", "name": "Layer 1",
+         "visible": True, "locked": False, "color": None}])
+    active_layer: str = "layer1"   # layer new stitches are created on
+
+    # -- layers ---------------------------------------------------------
+    def layer_def(self, lid: str) -> dict | None:
+        for l in self.layers:
+            if l["id"] == lid:
+                return l
+        return None
+
+    def layer_visible(self, lid: str) -> bool:
+        d = self.layer_def(lid)
+        return True if d is None else bool(d.get("visible", True))
+
+    def layer_locked(self, lid: str) -> bool:
+        d = self.layer_def(lid)
+        return False if d is None else bool(d.get("locked", False))
+
+    def layer_color(self, lid: str) -> str | None:
+        """Optional display-override color for a layer, or None."""
+        d = self.layer_def(lid)
+        return (d or {}).get("color")
 
     # -- stitch access ------------------------------------------------
     def add_stitch(self, s: Stitch) -> Stitch:
@@ -245,7 +340,7 @@ class Pattern:
         y0, y1 = min(y0, y1), max(y0, y1)
         out = []
         for s in self.stitches.values():
-            pts = [s.a] + ([s.b] if s.b else [])
+            pts = s.extent_points()
             if all(x0 <= x <= x1 and y0 <= y <= y1 for x, y in pts):
                 out.append(s)
         return out
@@ -278,6 +373,9 @@ class Pattern:
             "stitches": [s.to_dict() for s in self.stitches.values()],
             "instances": [inst.to_dict() for inst in self.instances],
             "blocks": {bid: b.to_dict() for bid, b in self.blocks.items()},
+            "guides": {k: sorted(v) for k, v in self.guides.items()},
+            "layers": [dict(l) for l in self.layers],
+            "active_layer": self.active_layer,
         }
 
     @staticmethod
@@ -298,4 +396,16 @@ class Pattern:
         p.blocks = {bid: Block.from_dict(bd) for bid, bd in d.get("blocks", {}).items()}
         for idd in d.get("instances", []):
             p.instances.append(BlockInstance.from_dict(idd, p.blocks))
+        g = d.get("guides") or {}
+        p.guides = {k: list(g.get(k, [])) for k in ("h", "v", "d1", "d2")}
+        layers = d.get("layers")
+        if layers:
+            p.layers = [dict(l) for l in layers]
+            if not any(l["id"] == "layer1" for l in p.layers):
+                p.layers.insert(0, {"id": "layer1", "name": "Layer 1",
+                                    "visible": True, "locked": False,
+                                    "color": None})
+        p.active_layer = d.get("active_layer", "layer1")
+        if p.layer_def(p.active_layer) is None:
+            p.active_layer = p.layers[0]["id"]
         return p

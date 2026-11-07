@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QRectF
+from PySide6.QtCore import Qt, QRectF, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QFont
 from PySide6.QtWidgets import QWidget
 
@@ -14,13 +14,22 @@ class Ruler(QWidget):
 
     Ticks are drawn in scene units so they stay glued to the grid under
     pan/zoom. Major ticks + labels every GRID_MAJOR cells.
+
+    Dragging outward from a ruler creates a guide line snapped to the
+    nearest grid line: guide_drag fires continuously while dragging,
+    guide_drop fires on release.
     """
+
+    guide_drag = Signal(object, int, int, int)  # orient, gx, gy, kind
+    guide_drop = Signal(object, int, int, int)
+    # kind: 0 = straight guide, 1 = "/" diagonal (Shift), 2 = "\" (Ctrl)
 
     def __init__(self, view, orientation=Qt.Orientation.Horizontal,
                  parent=None):
         super().__init__(parent)
         self.view = view
         self.orientation = orientation
+        self._dragging = False
         self.setAutoFillBackground(True)
         pal = self.palette()
         pal.setColor(self.backgroundRole(), QColor("#ececec"))
@@ -96,3 +105,51 @@ class Ruler(QWidget):
         else:
             p.drawLine(w - 1, 0, w - 1, h)
         p.end()
+
+    # -- guide dragging ---------------------------------------------------
+    def _point_at(self, event):
+        """Grid cell coords (gx, gy) under the cursor."""
+        vp = self.view.viewport()
+        gp = event.globalPosition().toPoint()
+        vp_pos = vp.mapFromGlobal(gp)
+        scene = self.view.mapToScene(vp_pos)
+        return (int(round(scene.x() / CELL)),
+                int(round(scene.y() / CELL)))
+
+    @staticmethod
+    def _kind(event) -> int:
+        mods = event.modifiers()
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            return 2
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            return 1
+        return 0
+
+    def _emit(self, signal, event):
+        gx, gy = self._point_at(event)
+        signal.emit(self.orientation, gx, gy, self._kind(event))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self.grabMouse()
+            self._emit(self.guide_drag, event)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            self._emit(self.guide_drag, event)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging and event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            self.releaseMouse()
+            self._emit(self.guide_drop, event)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
