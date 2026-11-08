@@ -70,6 +70,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._build_menus()
+        self._update_dup_state()
         self._wire_canvas()
         self._refresh_all()
         # repaint + status after undo/redo (commands update selection too)
@@ -253,9 +254,10 @@ class MainWindow(QMainWindow):
         otb.addSeparator()
 
         # -- selection edits ------------------------------------------
-        ebtn("dup", "Duplicate",
-             "Duplicate the selection  (Ctrl+D)",
-             self.duplicate_selection)
+        self.dup_btn = ebtn("dup", "Duplicate",
+                            "Duplicate the selection  (Ctrl+D) — "
+                            "unavailable while symmetry is active",
+                            self.duplicate_selection)
         rot_menu = QMenu(self)
         for deg in (90, 180, 270):
             rot_menu.addAction(
@@ -577,7 +579,8 @@ class MainWindow(QMainWindow):
         self._act(m, "&Redo", self.undo_stack.redo, "Ctrl+Y")
         m.addSeparator()
         self._act(m, "&Delete Selection", self.delete_selection, "Del")
-        self._act(m, "&Duplicate", self.duplicate_selection, "Ctrl+D")
+        self.dup_action = self._act(m, "&Duplicate",
+                                    self.duplicate_selection, "Ctrl+D")
         m.addSeparator()
         self._act(m, "Select &All", self.select_all, "Ctrl+A")
         self._act(m, "&Reselect Last Selection", self.reselect_last)
@@ -907,6 +910,17 @@ class MainWindow(QMainWindow):
             btn.setEnabled(self.canvas.tool is Tool.BLOCK
                            and self.canvas.pending_block is not None)
 
+    def _update_dup_state(self):
+        """Duplicate is disabled while symmetry axes are active — the
+        orbit expansion would duplicate unselected mirror counterparts."""
+        blocked = bool(self.canvas.active_symmetry_axes)
+        btn = getattr(self, "dup_btn", None)
+        if btn is not None:
+            btn.setEnabled(not blocked)
+        act = getattr(self, "dup_action", None)
+        if act is not None:
+            act.setEnabled(not blocked)
+
     def _set_symmetry(self, axis):
         act = self.sym_actions[axis]
         if act.isChecked():
@@ -915,6 +929,7 @@ class MainWindow(QMainWindow):
             self.canvas.symmetry_axes.discard(axis)
         self.canvas.viewport().update()
         self._refresh_sym_warnings()
+        self._update_dup_state()
 
     def _set_symmetry_on(self, checked):
         """Master symmetry switch — axis selections are preserved."""
@@ -922,6 +937,7 @@ class MainWindow(QMainWindow):
         self._sym_btn.setText("Symmetry" if checked else "Symmetry (off)")
         self.canvas.viewport().update()
         self._refresh_sym_warnings()
+        self._update_dup_state()
 
     def _toggle_guides(self, checked):
         self.canvas.guides_visible = checked
@@ -1332,6 +1348,10 @@ class MainWindow(QMainWindow):
 
     def duplicate_selection(self):
         """Copy selection offset by (1,1), select the copies, enter Move."""
+        if self.canvas.active_symmetry_axes:
+            self.statusBar().showMessage(
+                "Duplicate is unavailable while symmetry is active.")
+            return
         sel = self.canvas.selection
         if sel.empty:
             self.statusBar().showMessage("Select stitches or blocks first.")
