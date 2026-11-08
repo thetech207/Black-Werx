@@ -445,10 +445,16 @@ class MainWindow(QMainWindow):
             #SidePanel QComboBox, #SidePanel QTreeWidget,
             #SidePanel QListWidget {{
                 background:{c['win'].name()};
+                color:{c['txt'].name()};
                 border:1px solid {c['border'].name()};
                 border-radius:6px; padding:1px 4px; }}
             #SidePanel QTreeWidget::item, #SidePanel QListWidget::item {{
-                padding:1px 3px; border-radius:4px; }}
+                padding:1px 3px; border-radius:4px;
+                color:{c['txt'].name()}; }}
+            #SidePanel QTreeWidget::item:selected,
+            #SidePanel QListWidget::item:selected {{
+                color:{c['htxt'].name()};
+                background:{c['hi'].name()}; }}
             #SidePanel QLabel {{ color:{c['txt'].name()}; }}
         """
 
