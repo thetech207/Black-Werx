@@ -8,7 +8,9 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QListWidget,
                                QListWidgetItem, QPushButton, QLabel,
                                QHBoxLayout, QColorDialog, QComboBox,
                                QGroupBox, QInputDialog, QScrollArea,
-                               QFrame, QCheckBox)
+                               QFrame, QCheckBox, QTreeWidget,
+                               QTreeWidgetItem, QDialog,
+                               QDialogButtonBox)
 
 from ..core import palette
 from ..core.block import Block, BlockInstance
@@ -99,13 +101,14 @@ class ColorPanel(QWidget):
 
 
 class LibraryPanel(QWidget):
-    """Block library: global + project blocks with actions."""
+    """Block library: global + project blocks grouped into folders."""
 
     place_requested = Signal(object)     # Block, scope
     new_from_selection = Signal()
     edit_requested = Signal(object)      # (block, scope)
     delete_requested = Signal(object)
     promote_requested = Signal(object)   # project block -> global
+    folder_requested = Signal(object, object, str)  # (block, scope, folder)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -114,79 +117,159 @@ class LibraryPanel(QWidget):
         layout = QVBoxLayout(self)
 
         layout.addWidget(QLabel("Global library"))
-        self.global_list = QListWidget()
-        self.global_list.itemDoubleClicked.connect(
-            lambda it: self.place_requested.emit(
-                (self.global_blocks[it.data(Qt.ItemDataRole.UserRole)], "global")))
-        layout.addWidget(self.global_list)
+        self.global_tree = self._make_tree()
+        layout.addWidget(self.global_tree)
 
         layout.addWidget(QLabel("Project blocks"))
-        self.project_list = QListWidget()
-        self.project_list.itemDoubleClicked.connect(
-            lambda it: self.place_requested.emit(
-                (self.project_blocks[it.data(Qt.ItemDataRole.UserRole)], "project")))
-        layout.addWidget(self.project_list)
+        self.project_tree = self._make_tree()
+        layout.addWidget(self.project_tree)
 
         btn_row = QHBoxLayout()
         for text, sig in [
             ("Place", self._place_selected),
             ("New from selection", self.new_from_selection),
             ("Edit", self._edit_selected),
-            ("Delete", self._delete_selected),
-            ("Promote", self._promote_selected),
         ]:
             b = QPushButton(text)
             b.clicked.connect(sig)
             btn_row.addWidget(b)
         layout.addLayout(btn_row)
+        btn_row2 = QHBoxLayout()
+        for text, sig in [
+            ("Delete", self._delete_selected),
+            ("Promote", self._promote_selected),
+            ("Folder…", self._set_folder),
+        ]:
+            b = QPushButton(text)
+            b.clicked.connect(sig)
+            btn_row2.addWidget(b)
+        layout.addLayout(btn_row2)
+
+    def _make_tree(self) -> QTreeWidget:
+        tree = QTreeWidget()
+        tree.setHeaderHidden(True)
+        tree.setMinimumHeight(80)
+        tree.itemDoubleClicked.connect(self._on_double_click)
+        return tree
+
+    @staticmethod
+    def _block_item(tree: QTreeWidget, parent: QTreeWidgetItem | None,
+                    bid: str, b: Block):
+        it = QTreeWidgetItem([f"{b.name} ({len(b.stitches)}st)"])
+        it.setData(0, Qt.ItemDataRole.UserRole, bid)
+        if parent is not None:
+            parent.addChild(it)
+        else:
+            tree.addTopLevelItem(it)
+        return it
+
+    def _fill_tree(self, tree: QTreeWidget, blocks: dict,
+                   scope: str):
+        tree.clear()
+        folders: dict[str, QTreeWidgetItem] = {}
+        for bid, b in sorted(blocks.items(), key=lambda kv: kv[1].name):
+            if b.folder:
+                if b.folder not in folders:
+                    f = QTreeWidgetItem([b.folder])
+                    f.setFlags(f.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+                    tree.addTopLevelItem(f)
+                    folders[b.folder] = f
+                parent = folders[b.folder]
+                it = self._block_item(tree, parent, bid, b)
+            else:
+                # unfiled blocks sit at the top level, no pseudo-folder
+                it = self._block_item(tree, None, bid, b)
+            it.setData(0, Qt.ItemDataRole.UserRole + 1, scope)
+        tree.expandAll()
 
     def refresh(self):
-        self.global_list.clear()
-        for bid, b in sorted(self.global_blocks.items(), key=lambda kv: kv[1].name):
-            it = QListWidgetItem(f"{b.name} ({len(b.stitches)}st)")
-            it.setData(Qt.ItemDataRole.UserRole, bid)
-            self.global_list.addItem(it)
-        self.project_list.clear()
-        for bid, b in sorted(self.project_blocks.items(), key=lambda kv: kv[1].name):
-            it = QListWidgetItem(f"{b.name} ({len(b.stitches)}st)")
-            it.setData(Qt.ItemDataRole.UserRole, bid)
-            self.project_list.addItem(it)
+        self._fill_tree(self.global_tree, self.global_blocks, "global")
+        self._fill_tree(self.project_tree, self.project_blocks, "project")
 
-    def _selected(self, lst):
-        it = lst.currentItem()
-        return it.data(Qt.ItemDataRole.UserRole) if it else None
+    # -- selection helpers ----------------------------------------------
+    def _selected_leaf(self, tree: QTreeWidget):
+        """Return (bid, scope, block) for the selected block leaf."""
+        it = tree.currentItem()
+        if it is None:
+            return None
+        bid = it.data(0, Qt.ItemDataRole.UserRole)
+        scope = it.data(0, Qt.ItemDataRole.UserRole + 1)
+        if bid is None or scope is None:
+            return None
+        blocks = self.global_blocks if scope == "global" \
+            else self.project_blocks
+        b = blocks.get(bid)
+        return (bid, scope, b) if b else None
+
+    def _on_double_click(self, item: QTreeWidgetItem):
+        tree = item.treeWidget()
+        sel = self._selected_leaf(tree)
+        if sel is None:
+            return
+        bid, scope, b = sel
+        self.place_requested.emit((b, scope))
 
     def _place_selected(self):
-        bid = self._selected(self.global_list)
-        if bid:
-            self.place_requested.emit((self.global_blocks[bid], "global"))
-            return
-        bid = self.project_list and self._selected(self.project_list)
-        if bid:
-            self.place_requested.emit((self.project_blocks[bid], "project"))
+        for tree in (self.global_tree, self.project_tree):
+            sel = self._selected_leaf(tree)
+            if sel:
+                self.place_requested.emit((sel[2], sel[1]))
+                return
 
     def _edit_selected(self):
-        bid = self._selected(self.global_list)
-        if bid:
-            self.edit_requested.emit((self.global_blocks[bid], "global"))
-            return
-        bid = self._selected(self.project_list)
-        if bid:
-            self.edit_requested.emit((self.project_blocks[bid], "project"))
+        for tree in (self.global_tree, self.project_tree):
+            sel = self._selected_leaf(tree)
+            if sel:
+                self.edit_requested.emit((sel[2], sel[1]))
+                return
 
     def _delete_selected(self):
-        bid = self._selected(self.global_list)
-        if bid:
-            self.delete_requested.emit((self.global_blocks[bid], "global"))
-            return
-        bid = self._selected(self.project_list)
-        if bid:
-            self.delete_requested.emit((self.project_blocks[bid], "project"))
+        for tree in (self.global_tree, self.project_tree):
+            sel = self._selected_leaf(tree)
+            if sel:
+                self.delete_requested.emit((sel[2], sel[1]))
+                return
 
     def _promote_selected(self):
-        bid = self._selected(self.project_list)
-        if bid:
-            self.promote_requested.emit((self.project_blocks[bid], "project"))
+        sel = self._selected_leaf(self.project_tree)
+        if sel:
+            self.promote_requested.emit((sel[2], "project"))
+
+    def _set_folder(self):
+        """Move the selected block into a folder.
+
+        Dropdown lists every folder already in use (both libraries);
+        still editable so new folder names can be typed."""
+        for tree in (self.global_tree, self.project_tree):
+            sel = self._selected_leaf(tree)
+            if sel is None:
+                continue
+            bid, scope, b = sel
+            folders = sorted(
+                {x.folder for d in (self.global_blocks,
+                                    self.project_blocks)
+                 for x in d.values() if x.folder})
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Block folder")
+            lay = QVBoxLayout(dlg)
+            lay.addWidget(QLabel(f"Folder for '{b.name}':"))
+            combo = QComboBox()
+            combo.setEditable(True)
+            combo.addItem("(unfiled)")
+            combo.addItems(folders)
+            combo.setCurrentText(b.folder or "(unfiled)")
+            lay.addWidget(combo)
+            btns = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok
+                | QDialogButtonBox.StandardButton.Cancel)
+            btns.accepted.connect(dlg.accept)
+            btns.rejected.connect(dlg.reject)
+            lay.addWidget(btns)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                text = combo.currentText().strip()
+                folder = "" if text in ("", "(unfiled)") else text
+                self.folder_requested.emit(b, scope, folder)
+            return
 
 
 def make_block_from_stitches(name: str, stitches: list,

@@ -215,19 +215,25 @@ DMC_COLORS: list[tuple[str, str, str]] = [
 ]
 
 
+_DMC_HEX = {c: h for c, _n, h in DMC_COLORS}
+_RESOLVE_CACHE: dict[str, str] = {}
+
+
 def resolve(color: str) -> str:
     """Return "#rrggbb" for a color spec."""
     if not color:
         return "#000000"
     if color.startswith("#"):
         return color.lower()
+    hit = _RESOLVE_CACHE.get(color)
+    if hit is not None:
+        return hit
     if color.startswith("dmc:"):
-        code = color[4:]
-        for c, _n, h in DMC_COLORS:
-            if c == code:
-                return h
-        return "#000000"
-    return color.lower()
+        out = _DMC_HEX.get(color[4:], "#000000")
+    else:
+        out = color.lower()
+    _RESOLVE_CACHE[color] = out
+    return out
 
 
 def dmc_name(color: str) -> str | None:

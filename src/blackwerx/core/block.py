@@ -18,6 +18,7 @@ class Block:
 
     id: str
     name: str
+    folder: str = ""               # library folder ("" = unfiled)
     stitches: list[Stitch] = field(default_factory=list)
     instances: list["BlockInstance"] = field(default_factory=list)
 
@@ -70,13 +71,15 @@ class Block:
         return {
             "id": self.id,
             "name": self.name,
+            "folder": self.folder,
             "stitches": [s.to_dict() for s in self.stitches],
             "instances": [i.to_dict() for i in self.instances],
         }
 
     @staticmethod
     def from_dict(d: dict) -> "Block":
-        b = Block(id=d["id"], name=d.get("name", "Block"))
+        b = Block(id=d["id"], name=d.get("name", "Block"),
+                  folder=d.get("folder", ""))
         for sd in d.get("stitches", []):
             b.stitches.append(Stitch.from_dict(sd))
         for idd in d.get("instances", []):

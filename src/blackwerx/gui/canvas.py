@@ -8,7 +8,7 @@ from enum import Enum
 from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QPoint
 from PySide6.QtGui import (QColor, QPen, QPainter, QPainterPath, QFont,
                            QWheelEvent, QMouseEvent, QCursor, QPixmap,
-                           QImage)
+                           QImage, QBrush)
 from PySide6.QtWidgets import (QGraphicsView, QGraphicsScene,
                                QGraphicsItem, QAbstractScrollArea, QLabel)
 
@@ -39,6 +39,7 @@ class PatternItem(QGraphicsItem):
     def __init__(self, canvas: "PatternCanvas"):
         super().__init__()
         self.canvas = canvas
+        self._pens: dict = {}   # (hexcol, alpha) -> QPen cache
 
     def boundingRect(self) -> QRectF:
         c = self.canvas
@@ -60,6 +61,22 @@ class PatternItem(QGraphicsItem):
         c = self.canvas
         p = c.pattern
         minx, miny, maxx, maxy = self._grid_bounds()
+
+        # visible region in cell units — cull dots/stitches to the
+        # viewport so repaints don't redraw the whole workspace
+        vp = c.viewport().rect()
+        tl = c.mapToScene(vp.topLeft())
+        br = c.mapToScene(vp.bottomRight())
+        x0, x1 = tl.x() / CELL - 1, br.x() / CELL + 1
+        y0, y1 = tl.y() / CELL - 1, br.y() / CELL + 1
+
+        def stitch_visible(s):
+            if s.kind is StitchKind.X:
+                return not (s.a[0] + 1 < x0 or s.a[0] > x1
+                            or s.a[1] + 1 < y0 or s.a[1] > y1)
+            pa, pb = s.endpoints()
+            return not (max(pa[0], pb[0]) < x0 or min(pa[0], pb[0]) > x1
+                        or max(pa[1], pb[1]) < y0 or min(pa[1], pb[1]) > y1)
 
         # workspace background (non-printing margin around the fabric)
         ws = WORKSPACE
@@ -92,16 +109,22 @@ class PatternItem(QGraphicsItem):
                                 (p.width + 1) * CELL,
                                 (p.height + 1) * CELL))
 
-        # dot grid: intersections are holes; darker every GRID_MAJOR
+        # dot grid: intersections are holes; darker every GRID_MAJOR.
+        # Only draw dots inside the exposed region.
+        gx_lo = max(minx, math.floor(x0))
+        gx_hi = min(maxx + 1, math.ceil(x1))
+        gy_lo = max(miny, math.floor(y0))
+        gy_hi = min(maxy + 1, math.ceil(y1))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor("#c9bfa9"))
-        for gx in range(minx, maxx + 2):
-            for gy in range(miny, maxy + 2):
+        for gx in range(gx_lo, gx_hi + 1):
+            for gy in range(gy_lo, gy_hi + 1):
                 painter.drawEllipse(QRectF(gx * CELL - 1.4,
                                             gy * CELL - 1.4, 2.8, 2.8))
         painter.setBrush(QColor("#6f6046"))
-        for gx in range(minx - (minx % GRID_MAJOR), maxx + 2, GRID_MAJOR):
-            for gy in range(miny - (miny % GRID_MAJOR), maxy + 2,
+        for gx in range(gx_lo - (gx_lo % GRID_MAJOR), gx_hi + 1,
+                        GRID_MAJOR):
+            for gy in range(gy_lo - (gy_lo % GRID_MAJOR), gy_hi + 1,
                             GRID_MAJOR):
                 painter.drawEllipse(QRectF(gx * CELL - 2.4,
                                             gy * CELL - 2.4, 4.8, 4.8))
@@ -109,7 +132,7 @@ class PatternItem(QGraphicsItem):
         # stitches (raw pattern), honoring layer visibility + display color
         warn = c.sym_warn_keys
         for s in p.stitches.values():
-            if not p.layer_visible(s.layer):
+            if not p.layer_visible(s.layer) or not stitch_visible(s):
                 continue
             override = p.layer_color(s.layer)
             self._draw_stitch(painter, s,
@@ -196,7 +219,7 @@ class PatternItem(QGraphicsItem):
         # resolved block instances (cached), honoring layer visibility
         for inst in p.instances:
             for s in c.resolved_stitches(inst):
-                if not p.layer_visible(s.layer):
+                if not p.layer_visible(s.layer) or not stitch_visible(s):
                     continue
                 override = p.layer_color(s.layer)
                 col = override or palette.resolve(
@@ -217,18 +240,21 @@ class PatternItem(QGraphicsItem):
                     self._draw_stitch_outline(painter, s)
 
     def _draw_stitch(self, painter, s: Stitch, hexcol: str, alpha=255):
-        col = QColor(hexcol)
-        col.setAlpha(int(alpha * 255) if alpha <= 1.0 else int(alpha))
-        pen = QPen(col, max(1.2, CELL * 0.16))
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        a = int(alpha * 255) if alpha <= 1.0 else int(alpha)
+        pkey = (hexcol, a)
+        pen = self._pens.get(pkey)
+        if pen is None:
+            col = QColor(hexcol)
+            col.setAlpha(a)
+            pen = QPen(col, max(1.2, CELL * 0.16))
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            self._pens[pkey] = pen
         painter.setPen(pen)
         if s.kind is StitchKind.X:
             cx, cy = (s.a[0] + 0.5) * CELL, (s.a[1] + 0.5) * CELL
             h = CELL * 0.5
-            path = QPainterPath()
-            path.moveTo(cx - h, cy - h); path.lineTo(cx + h, cy + h)
-            path.moveTo(cx + h, cy - h); path.lineTo(cx - h, cy + h)
-            painter.drawPath(path)
+            painter.drawLine(cx - h, cy - h, cx + h, cy + h)
+            painter.drawLine(cx + h, cy - h, cx - h, cy + h)
         else:
             pa, pb = s.endpoints()
             painter.drawLine(pa[0] * CELL, pa[1] * CELL,
@@ -265,11 +291,24 @@ class Selection:
 class PatternCanvas(QGraphicsView):
     """View hosting the pattern; emits high-level edit signals."""
 
+    # single-key tool shortcuts
+    _TOOL_KEYS = {
+        Qt.Key.Key_X: Tool.PENCIL,       # X Stitch
+        Qt.Key.Key_L: Tool.XLINE,        # X Line
+        Qt.Key.Key_B: Tool.BACKSTITCH,   # Backstitch
+        Qt.Key.Key_E: Tool.ERASER,       # Eraser
+        Qt.Key.Key_S: Tool.SELECT,       # Select
+        Qt.Key.Key_M: Tool.MOVE,         # Move
+        Qt.Key.Key_R: Tool.ROTATE,       # Rotate
+        Qt.Key.Key_P: Tool.PAN,          # Pan
+    }
+
     # signals
     cursor_cell_changed = Signal(int, int)
     draw_stitches = Signal(list)          # list[Stitch] already symmetry-expanded
     erase_keys = Signal(list)           # list of stitch keys under eraser
-    place_block = Signal(object, str, int, int, int, int, bool, bool)
+    place_block = Signal(object, str, int, int, int, int, bool, bool,
+                         tuple)             # + (rows,cols,dx,dy,centered)
     # Block, scope, gx, gy, anchor, rot, mirror_x, mirror_y
     tool_changed = Signal(object)
     context_menu = Signal(object)   # viewport pos for right-click menu
@@ -287,15 +326,26 @@ class PatternCanvas(QGraphicsView):
         self.tool = Tool.SELECT
         self.current_color = "#000000"
         self.fabric_color = "#F5F0E6"
-        self.symmetry_axes: set = set()
+        self.symmetry_axes: set = set()   # selected axes (persist when off)
+        self.symmetry_on = True           # master symmetry switch
         self.sym_warn_keys: set = set()   # stitches w/o full symmetry orbit
         self.selection = Selection()
+        self.selection_changed.connect(self._clear_ghost_cache)
         self.pending_block = None  # Block to place
         self.pending_scope = "project"
         self.place_anchor = 5      # 3x3 anchor key (numpad layout, 5=center)
         self.place_rot = 0         # pending placement rotation (deg)
         self.place_mx = False      # pending placement mirror X
         self.place_my = False      # pending placement mirror Y
+        # array placement: rows x cols grid, dx/dy gap in stitches.
+        # Values persist for the Array dialog, but only apply while
+        # array_armed (set by the dialog, consumed by one placement).
+        self.array_rows = 1
+        self.array_cols = 1
+        self.array_dx = 0
+        self.array_dy = 0
+        self.array_centered = False
+        self.array_armed = False
         self.line_width = 1        # X-line thickness in stitches
         self._drag_start_cell = None
         self._drag_last_cell = None
@@ -309,6 +359,8 @@ class PatternCanvas(QGraphicsView):
         self._pan_start = None
         self._panning = False
         self._resolve_cache: dict = {}
+        self._ghost_cache: dict = {}      # ghost stroke lists per params
+        self._ghost_base_cache = {}       # resolved block-local stitches
         self._last_mouse_scene = QPointF(0, 0)
         self._ghost_cell = None
         self._back_current = None
@@ -397,6 +449,8 @@ class PatternCanvas(QGraphicsView):
 
     def set_tool(self, tool: Tool):
         self.tool = tool
+        if tool is not Tool.BLOCK:
+            self.array_armed = False   # leaving block placement disarms
         self._clear_anchor()
         self._poly = None
         self._move_anchor = self._move_cur = self._move_target = None
@@ -427,6 +481,10 @@ class PatternCanvas(QGraphicsView):
                 extras.append("flipV")
             if extras:
                 text += " " + "/".join(extras)
+            if self.array_armed and (self.array_rows > 1
+                                     or self.array_cols > 1):
+                text += (f"  ·array {self.array_rows}x{self.array_cols}"
+                         f" gap {self.array_dx},{self.array_dy}")
         self.tool_label.setText(text)
         self.tool_label.adjustSize()
         vp = self.viewport()
@@ -447,14 +505,17 @@ class PatternCanvas(QGraphicsView):
             self.viewport().update()
 
     def refresh_cursor(self):
-        """Tool-specific cursor showing the stitch glyph in thread color."""
+        """Tool-specific cursor: pencil for X tools, glyph per tool."""
         if self._panning:
             return
         if self.tool is Tool.MOVE:
             self.viewport().setCursor(Qt.CursorShape.SizeAllCursor)
             return
-        if self.tool is Tool.ROTATE:
-            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+        if self.tool is Tool.SELECT:
+            self.viewport().unsetCursor()   # standard arrow
+            return
+        if self.tool is Tool.PAN:
+            self.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
             return
         size = 36
         img = QImage(size, size, QImage.Format.Format_ARGB32)
@@ -488,43 +549,87 @@ class PatternCanvas(QGraphicsView):
             p.drawLine(int(size - m - 4), int(size - m - 4),
                        int(size - m + 2), int(size - m + 2))
 
-        if self.tool in (Tool.PENCIL, Tool.XLINE, Tool.BACKSTITCH):
+        if self.tool is Tool.PENCIL:
             draw_pencil(col)
+            # tiny X at the tip: this tool fills stitch cells
+            tx, ty = int(m - 1), int(m - 1)
+            xp = QPen(col, 2)
+            xp.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(xp)
+            p.drawLine(tx - 3, ty - 3, tx + 3, ty + 3)
+            p.drawLine(tx - 3, ty + 3, tx + 3, ty - 3)
+        elif self.tool is Tool.XLINE:
+            draw_pencil(col)
+            # dashed line trailing from the tip: this tool draws lines
+            dp = QPen(col, 1.5, Qt.PenStyle.DashLine)
+            p.setPen(dp)
+            p.drawLine(int(m - 1), int(m - 1), int(m + 12), int(m + 12))
+        elif self.tool is Tool.BACKSTITCH:
+            # minimal crosshair on the snap dot
+            white = QPen(QColor("#ffffff"), 3.5)
+            white.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(white)
+            p.drawLine(int(c - 8), int(c), int(c + 8), int(c))
+            p.drawLine(int(c), int(c - 8), int(c), int(c + 8))
+            sp = QPen(col, 1.8)
+            sp.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(sp)
+            p.drawLine(int(c - 8), int(c), int(c + 8), int(c))
+            p.drawLine(int(c), int(c - 8), int(c), int(c + 8))
+            p.setBrush(QBrush(col))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(int(c - 1), int(c - 1), 3, 3)
         elif self.tool is Tool.ERASER:
-            pen = QPen(QColor("#d33"), 3.5)
+            # compact red X — smaller than the stitch glyphs
+            em = 12
+            pen = QPen(QColor("#d33"), 3)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             p.setPen(pen)
-            p.drawLine(int(m), int(m), int(size - m), int(size - m))
-            p.drawLine(int(size - m), int(m), int(m), int(size - m))
-            p.setPen(QPen(QColor("#ffffff"), 1.5))
-            p.drawLine(int(m), int(m), int(size - m), int(size - m))
-            p.drawLine(int(size - m), int(m), int(m), int(size - m))
-        elif self.tool is Tool.SELECT:
-            pen = QPen(QColor("#2266ff"), 2)
-            p.setPen(pen)
-            L = 10
-            for sx, sy in [(1, 1), (-1, 1), (1, -1), (-1, -1)]:
-                x0 = c + sx * (c - m); y0 = c + sy * (c - m)
-                x1 = c + sx * (c - m - L); y1 = y0
-                x2 = x0; y2 = c + sy * (c - m - L)
-                p.drawLine(int(x0), int(y0), int(x1), int(y1))
-                p.drawLine(int(x0), int(y0), int(x2), int(y2))
+            p.drawLine(em, em, size - em, size - em)
+            p.drawLine(size - em, em, em, size - em)
+            p.setPen(QPen(QColor("#ffffff"), 1.2))
+            p.drawLine(em, em, size - em, size - em)
+            p.drawLine(size - em, em, em, size - em)
+        elif self.tool is Tool.ROTATE:
+            # near-full circular arrow = rotation, gap at upper right
+            import math
+            r = 12.0
+            pts = [QPointF(c + r * math.cos(math.radians(a)),
+                           c + r * math.sin(math.radians(a)))
+                   for a in range(80, 391, 5)]
+            rp = QPen(QColor("#cc7700"), 3)
+            rp.setCapStyle(Qt.PenCapStyle.RoundCap)
+            rp.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(rp)
+            p.drawPolyline(pts)
+            # arrowhead: tip at 30°, wings back along the arc
+            def arc_pt(deg):
+                a = math.radians(deg)
+                return QPointF(c + r * math.cos(a), c + r * math.sin(a))
+            tip = arc_pt(30)
+            p.drawLine(tip, arc_pt(8))
+            p.drawLine(tip, arc_pt(-12))
+            p.setBrush(QBrush(QColor("#cc7700")))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(int(c - 2), int(c - 2), 4, 4)
         elif self.tool is Tool.BLOCK:
-            pen = QPen(QColor("#2266ff"), 2, Qt.PenStyle.DashLine)
-            p.setPen(pen)
-            p.drawRect(int(m), int(m), int(size - 2 * m), int(size - 2 * m))
-        # PAN keeps default arrow
+            # dashed frame + solid inner square = a block being stamped
+            bp = QPen(QColor("#2266ff"), 1.8, Qt.PenStyle.DashLine)
+            p.setPen(bp)
+            p.drawRect(int(m), int(m), int(size - 2 * m),
+                       int(size - 2 * m))
+            p.setBrush(QBrush(QColor("#2266ff")))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRect(int(c - 5), int(c - 5), 10, 10)
+        # PAN uses OpenHandCursor above; no custom pixmap needed
         p.end()
 
-        if self.tool in (Tool.PENCIL, Tool.XLINE, Tool.BACKSTITCH, Tool.ERASER,
-                         Tool.SELECT, Tool.BLOCK):
-            # hotspot at the pencil tip for stitch tools, center otherwise
-            hx = hy = int(size / 2)
-            if self.tool in (Tool.PENCIL, Tool.XLINE, Tool.BACKSTITCH):
-                hx = hy = int(m - 1)
-            self.viewport().setCursor(QCursor(QPixmap.fromImage(img), hx, hy))
+        if self.tool in (Tool.PENCIL, Tool.XLINE):
+            # hotspot at the pencil tip
+            hx = hy = int(m - 1)
         else:
-            self.viewport().unsetCursor()
+            hx = hy = int(size / 2)
+        self.viewport().setCursor(QCursor(QPixmap.fromImage(img), hx, hy))
 
     # -- scene management ---------------------------------------------
     def _update_scene_rect(self):
@@ -540,10 +645,17 @@ class PatternCanvas(QGraphicsView):
         return QPointF(self.pattern.width / 2 * CELL,
                        self.pattern.height / 2 * CELL)
 
+    @property
+    def active_symmetry_axes(self):
+        """Axes actually applied right now (empty when symmetry is off)."""
+        return self.symmetry_axes if self.symmetry_on else set()
+
     def set_pattern(self, pattern: Pattern):
         self.pattern = pattern
         self.selection.clear()
         self._resolve_cache.clear()
+        self._ghost_cache.clear()
+        self._ghost_base_cache.clear()
         g = pattern.guides
         self.guides_h = set(g.get("h", []))
         self.guides_v = set(g.get("v", []))
@@ -555,6 +667,8 @@ class PatternCanvas(QGraphicsView):
 
     def refresh(self):
         self._resolve_cache.clear()
+        self._ghost_cache.clear()
+        self._ghost_base_cache.clear()
         self.viewport().update()
 
     # -- coordinate helpers --------------------------------------------
@@ -599,6 +713,9 @@ class PatternCanvas(QGraphicsView):
         return (p.x() / CELL, p.y() / CELL)
 
     # -- block resolution cache ----------------------------------------
+    def _clear_ghost_cache(self):
+        self._ghost_cache.clear()
+
     def resolved_stitches(self, inst) -> list[Stitch]:
         key = (inst.uid, inst.block_id, inst.scope, inst.layer,
                (inst.transform.m00, inst.transform.m01, inst.transform.m10,
@@ -755,6 +872,13 @@ class PatternCanvas(QGraphicsView):
                 self.status_message.emit(f"placement anchor: {num}")
                 event.accept()
                 return
+        # single-key tool shortcuts (plain keys, no modifiers)
+        tool = self._TOOL_KEYS.get(event.key())
+        if tool is not None \
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+            self.set_tool(tool)
+            event.accept()
+            return
         if event.key() == Qt.Key.Key_Space:
             self._panning = True
             self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
@@ -856,7 +980,12 @@ class PatternCanvas(QGraphicsView):
                 self.place_block.emit(self.pending_block, self.pending_scope,
                                       cell[0], cell[1], self.place_anchor,
                                       self.place_rot, self.place_mx,
-                                      self.place_my)
+                                      self.place_my, self._array_tuple())
+                # array is one-shot: consumed by this placement
+                if self.array_armed:
+                    self.array_armed = False
+                    self._update_tool_label()
+                    self.viewport().update()
         elif self.tool is Tool.MOVE:
             if self.selection.empty:
                 self.status_message.emit("Move: select stitches or blocks first.")
@@ -1091,6 +1220,26 @@ class PatternCanvas(QGraphicsView):
                 .then(inner)
                 .then(Transform.translation(ax, ay)))
 
+    def _array_tuple(self):
+        """Effective array spec — (1,1,...) unless armed."""
+        if not self.array_armed:
+            return (1, 1, 0, 0, False)
+        return (self.array_rows, self.array_cols,
+                self.array_dx, self.array_dy, self.array_centered)
+
+    def _array_offsets(self):
+        """(dc, dr) cell offsets for each array element."""
+        if not self.array_armed:
+            return [(0, 0)]
+        rows = max(1, self.array_rows)
+        cols = max(1, self.array_cols)
+        if rows == 1 and cols == 1:
+            return [(0, 0)]
+        c0 = -(cols - 1) // 2 if self.array_centered else 0
+        r0 = -(rows - 1) // 2 if self.array_centered else 0
+        return [(c0 + c, r0 + r)
+                for r in range(rows) for c in range(cols)]
+
     def _ghost_bbox(self, bb):
         """Block bbox after pending rot/mirror (for ghost outline)."""
         if not (self.place_rot or self.place_mx or self.place_my):
@@ -1286,7 +1435,7 @@ class PatternCanvas(QGraphicsView):
                         b_cell[0] + 0.5 + nx * off, b_cell[1] + 0.5 + ny * off)
         stitches = [Stitch(StitchKind.X, c, None, self.current_color)
                     for c in sorted(cells)]
-        stitches = apply_symmetry(stitches, self.symmetry_axes,
+        stitches = apply_symmetry(stitches, self.active_symmetry_axes,
                                   self.pattern.width, self.pattern.height)
         self._emit_with_layer(stitches)
 
@@ -1310,7 +1459,7 @@ class PatternCanvas(QGraphicsView):
         """Segment the line into per-grid-unit backstitches."""
         from ..core.symmetry import apply_symmetry
         stitches = self._backline_stitches(a_pt, b_pt, self.current_color)
-        stitches = apply_symmetry(stitches, self.symmetry_axes,
+        stitches = apply_symmetry(stitches, self.active_symmetry_axes,
                                   self.pattern.width, self.pattern.height)
         self._emit_with_layer(stitches)
 
@@ -1323,7 +1472,7 @@ class PatternCanvas(QGraphicsView):
                 if a != b:
                     stitches.extend(
                         self._backline_stitches(a, b, self.current_color))
-            stitches = apply_symmetry(stitches, self.symmetry_axes,
+            stitches = apply_symmetry(stitches, self.active_symmetry_axes,
                                       self.pattern.width, self.pattern.height)
             self._emit_with_layer(stitches)
             self.status_message.emit(f"polyline committed ({len(self._poly)} points)")
@@ -1335,7 +1484,7 @@ class PatternCanvas(QGraphicsView):
     def _emit_pencil(self, cell):
         from ..core.symmetry import apply_symmetry
         s = Stitch(StitchKind.X, cell, None, self.current_color)
-        stitches = apply_symmetry([s], self.symmetry_axes,
+        stitches = apply_symmetry([s], self.active_symmetry_axes,
                                   self.pattern.width, self.pattern.height)
         self._emit_with_layer(stitches)
 
@@ -1543,6 +1692,13 @@ class PatternCanvas(QGraphicsView):
                 x, y = cx + ddx, cy + ddy
             return (x, y)
 
+        # cache per quantized transform — mouse moves within the same
+        # cell delta reuse the stroke list instead of recomputing
+        gkey = ("m", dx, dy) if rot is None else ("r",) + rot
+        hit = self._ghost_cache.get(gkey)
+        if hit is not None:
+            return hit
+
         out = []
         for k in self.selection.stitch_keys:
             s = self.pattern.stitches.get(k)
@@ -1558,14 +1714,19 @@ class PatternCanvas(QGraphicsView):
                             xf(s.b) if s.b else None,
                             self.instance_color(inst, s.color),
                             s.ta, s.tb))
+        self._ghost_cache[gkey] = out
         return out
 
     def _draw_ghost_strokes(self, painter: QPainter, strokes):
+        pens = {}
         for kind, a, b, color, ta, tb in strokes:
-            col = QColor(palette.resolve(color))
-            col.setAlpha(80)
-            pen = QPen(col, max(1.2, CELL * 0.16))
-            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen = pens.get(color)
+            if pen is None:
+                col = QColor(palette.resolve(color))
+                col.setAlpha(80)
+                pen = QPen(col, max(1.2, CELL * 0.16))
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pens[color] = pen
             painter.setPen(pen)
             if kind is StitchKind.X:
                 cx, cy = (a[0] + 0.5) * CELL, (a[1] + 0.5) * CELL
@@ -1582,14 +1743,24 @@ class PatternCanvas(QGraphicsView):
         """Paint selected stitches ghosted at their pending transform."""
         self._draw_ghost_strokes(painter, self._ghost_strokes())
 
-    def _block_ghost_strokes(self):
-        """Pending block's resolved stitches at the ghost position."""
+    def _block_ghost_stitches(self):
+        """Pending block's resolved stitches at the ghost position,
+        expanded over the placement array."""
         if self.pending_block is None or self._ghost_cell is None:
             return []
         bb = self.pending_block.bbox()
         if not bb:
             return []
         gx, gy = self._ghost_cell
+        # cache key covers every input to the ghost computation
+        b = self.pending_block
+        fp = (len(b.stitches), len(b.instances),
+              id(b.stitches), id(b.instances))
+        gkey = (id(b), gx, gy, self.place_anchor, self.place_rot,
+                self.place_mx, self.place_my, self._array_tuple(), fp)
+        hit = self._ghost_cache.get(("block",) + gkey)
+        if hit is not None:
+            return hit
         ax, ay = self._block_anchor(bb)
         ax, ay = int(round(ax)), int(round(ay))
         inner = Transform.from_semantic(0, 0, self.place_rot,
@@ -1597,11 +1768,40 @@ class PatternCanvas(QGraphicsView):
         local = (Transform.translation(-ax, -ay)
                  .then(inner)
                  .then(Transform.translation(ax, ay)))
-        t = local.then(Transform.translation(gx - ax, gy - ay))
         reg = {**self.pattern.blocks, **self.library_blocks}
-        return [(s.kind, s.a, s.b, s.color, s.ta, s.tb)
-                for s in self.pending_block.resolved_stitches(
-                    t, registry=reg)]
+        # resolve once in block-local space, then transform per cell —
+        # much cheaper than re-resolving for every array element
+        from ..core.model import transform_stitch
+        base = self._ghost_base(b, reg)
+        # spacing is the GAP between block edges: step = placed bbox
+        # size + gap (bbox after pending rot/mirror, before placement)
+        gbb = self._ghost_bbox(bb)
+        step_x = int(round(gbb[2] - gbb[0])) + self.array_dx
+        step_y = int(round(gbb[3] - gbb[1])) + self.array_dy
+        out = []
+        for dc, dr in self._array_offsets():
+            t = local.then(Transform.translation(
+                gx - ax + dc * step_x,
+                gy - ay + dr * step_y))
+            for s in base:
+                ts = transform_stitch(s, t)
+                out.append((ts.kind, ts.a, ts.b, ts.color,
+                            ts.ta, ts.tb))
+        self._ghost_cache[("block",) + gkey] = out
+        return out
+
+    def _ghost_base(self, block, registry):
+        """Block-local resolved stitches, cached per block content."""
+        fp = (len(block.stitches), len(block.instances),
+              id(block.stitches), id(block.instances))
+        key = (id(block), fp)
+        if key not in self._ghost_base_cache:
+            self._ghost_base_cache[key] = block.resolved_stitches(
+                Transform.IDENTITY, registry=registry)
+        return self._ghost_base_cache[key]
+
+    def _block_ghost_strokes(self):
+        return self._block_ghost_stitches()
 
     def _eraser_keys_at(self, scene_pt) -> list:
         """Stitch keys the eraser would remove at a scene point.
@@ -1650,7 +1850,7 @@ class PatternCanvas(QGraphicsView):
 
     def _draw_symmetry_axes(self, painter: QPainter):
         """Overlay showing active symmetry modes and their axes."""
-        axes = self.symmetry_axes
+        axes = self.active_symmetry_axes
         if not axes:
             return
         p = self.pattern

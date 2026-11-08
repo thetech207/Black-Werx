@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QMainWindow, QApplication, QWidget,
                                QMessageBox, QInputDialog, QDialog,
                                QFormLayout, QComboBox, QCheckBox, QSpinBox,
                                QDoubleSpinBox, QDialogButtonBox, QMenu,
-                               QSplitter, QToolButton)
+                               QSplitter, QToolButton, QPushButton)
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import QUndoView
 
@@ -48,6 +48,7 @@ class MainWindow(QMainWindow):
         self._settings = QSettings("BlackWerx", "BlackWerx")
 
         self.pattern = Pattern()
+        self._load_canvas_defaults(self.pattern)
         self.library = Library()
         self.library_blocks = {b.id: b for b in self.library.all()}
         self.undo_stack = QUndoStack(self)
@@ -108,6 +109,20 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, tb)
         self.tool_group = []
+        tool_tips = {
+            Tool.PENCIL: "X Stitch — click/drag to stitch cells  (X)",
+            Tool.XLINE: "X Line — click two points for a stitched line  (L)",
+            Tool.BACKSTITCH: "Backstitch — click points for a line; "
+                             "right-click finishes  (B)",
+            Tool.ERASER: "Eraser — drag over stitches to remove  (E)",
+            Tool.SELECT: "Select — click/drag to select stitches "
+                         "and blocks  (S)",
+            Tool.MOVE: "Move — drag selected stitches/blocks  (M)",
+            Tool.ROTATE: "Rotate — pick a center, drag to rotate  (R)",
+            Tool.BLOCK: "Place Block — pick a block in the library, "
+                        "then click to place",
+            Tool.PAN: "Pan — drag to move the view  (P, or Space-drag)",
+        }
         for tool, label in [
             (Tool.PENCIL, "X Stitch"), (Tool.XLINE, "X Line"),
             (Tool.BACKSTITCH, "Backstitch"),
@@ -118,6 +133,7 @@ class MainWindow(QMainWindow):
         ]:
             act = QAction(label, self)
             act.setCheckable(True)
+            act.setToolTip(tool_tips[tool])
             act.triggered.connect(lambda _=False, t=tool: self._set_tool(t))
             tb.addAction(act)
             self.tool_group.append((tool, act))
@@ -126,10 +142,19 @@ class MainWindow(QMainWindow):
         # symmetry dropdown on the tool bar
         sym_btn = QToolButton(self)
         sym_btn.setText("Symmetry")
+        sym_btn.setToolTip(
+            "Symmetry — mirror new stitches and edits across axes")
         sym_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         sym_btn.setToolButtonStyle(
             Qt.ToolButtonStyle.ToolButtonTextOnly)
         sym_menu = QMenu(sym_btn)
+        self._sym_btn = sym_btn
+        self.sym_on_action = QAction("Enabled", self)
+        self.sym_on_action.setCheckable(True)
+        self.sym_on_action.setChecked(True)
+        self.sym_on_action.triggered.connect(self._set_symmetry_on)
+        sym_menu.addAction(self.sym_on_action)
+        sym_menu.addSeparator()
         self.sym_actions = {}
         for axis, label in [
                 ("h", "Left / right"), ("v", "Top / bottom"),
@@ -156,6 +181,13 @@ class MainWindow(QMainWindow):
         self.width_spin.valueChanged.connect(
             lambda v: setattr(self.canvas, "line_width", v))
         otb.addWidget(self.width_spin)
+        otb.addSeparator()
+        self.array_btn = QPushButton("Array…")
+        self.array_btn.setToolTip(
+            "Place blocks in a rows×columns array with spacing")
+        self.array_btn.clicked.connect(self._array_dialog)
+        self.array_btn.setEnabled(False)
+        otb.addWidget(self.array_btn)
 
         # undo view dock
         self.undo_view = QUndoView(self.undo_stack)
@@ -346,6 +378,7 @@ class MainWindow(QMainWindow):
         self.library_panel.edit_requested.connect(self._on_edit_block)
         self.library_panel.delete_requested.connect(self._on_delete_block)
         self.library_panel.promote_requested.connect(self._on_promote_block)
+        self.library_panel.folder_requested.connect(self._on_block_folder)
         self.layer_panel.layers_changed.connect(self._on_layers_changed)
         self.layer_panel.active_changed.connect(self._on_active_layer)
         self.layer_panel.guides_toggled.connect(self._on_guides_toggled)
@@ -502,7 +535,7 @@ class MainWindow(QMainWindow):
         """Flag stitches that can't be edited symmetrically (missing orbit
         counterparts) while symmetry axes are active."""
         from .core.symmetry import orphan_stitch_keys
-        axes = self.canvas.symmetry_axes
+        axes = self.canvas.active_symmetry_axes
         key = (self.undo_stack.index(), frozenset(axes),
                self.pattern.width, self.pattern.height)
         if key == self._sym_warn_key:
@@ -543,9 +576,16 @@ class MainWindow(QMainWindow):
     def _set_tool(self, tool):
         self.canvas.set_tool(tool)
         self.canvas.setFocus()   # canvas keys (Esc, arrows, R/F/V) need it
+        self._update_array_btn()
         if tool is Tool.BLOCK and self.canvas.pending_block is None:
             self.statusBar().showMessage(
                 "Select a block in the library panel, then click to place.")
+
+    def _update_array_btn(self):
+        btn = getattr(self, "array_btn", None)
+        if btn is not None:
+            btn.setEnabled(self.canvas.tool is Tool.BLOCK
+                           and self.canvas.pending_block is not None)
 
     def _set_symmetry(self, axis):
         act = self.sym_actions[axis]
@@ -554,36 +594,72 @@ class MainWindow(QMainWindow):
         else:
             self.canvas.symmetry_axes.discard(axis)
         self.canvas.viewport().update()
+        self._refresh_sym_warnings()
+
+    def _set_symmetry_on(self, checked):
+        """Master symmetry switch — axis selections are preserved."""
+        self.canvas.symmetry_on = checked
+        self._sym_btn.setText("Symmetry" if checked else "Symmetry (off)")
+        self.canvas.viewport().update()
+        self._refresh_sym_warnings()
 
     def _toggle_guides(self, checked):
         self.canvas.guides_visible = checked
         self.layer_panel.set_guides_visible(checked)
         self.canvas.viewport().update()
 
+    # -- canvas settings persistence ------------------------------------
+    def _load_canvas_defaults(self, pattern):
+        """Seed a fresh pattern with the last-used canvas settings."""
+        s = self._settings
+        pattern.aida_count = int(s.value(
+            "canvas/aida", pattern.aida_count))
+        pattern.stitch_w_mm = float(s.value(
+            "canvas/stitch_w_mm", pattern.stitch_w_mm))
+        pattern.stitch_h_mm = float(s.value(
+            "canvas/stitch_h_mm", pattern.stitch_h_mm))
+        w = int(s.value("canvas/width", pattern.width))
+        h = int(s.value("canvas/height", pattern.height))
+        pattern.width = w + w % 2      # keep even counts
+        pattern.height = h + h % 2
+
+    def _save_canvas_settings(self):
+        p = self.pattern
+        s = self._settings
+        s.setValue("canvas/aida", p.aida_count)
+        s.setValue("canvas/stitch_w_mm", p.stitch_w_mm)
+        s.setValue("canvas/stitch_h_mm", p.stitch_h_mm)
+        s.setValue("canvas/width", p.width)
+        s.setValue("canvas/height", p.height)
+
+    def _apply_canvas_values(self, v):
+        """Apply accepted CanvasSetupDialog values to self.pattern."""
+        self.pattern.aida_count = v["aida"]
+        if v["size_mode"] == "inches":
+            self.pattern.width = max(1, round(v["size_w"] * v["aida"]))
+            self.pattern.height = max(1, round(v["size_h"] * v["aida"]))
+        else:
+            self.pattern.width = max(1, round(v["size_w"]))
+            self.pattern.height = max(1, round(v["size_h"]))
+        # even counts only: keeps the symmetry center on a grid dot
+        self.pattern.width += self.pattern.width % 2
+        self.pattern.height += self.pattern.height % 2
+        self.canvas._update_scene_rect()
+        self.canvas.centerOn(self.canvas.pattern_center_scene())
+        self.canvas.viewport().update()
+        self.pattern.stitch_w_mm = v["w"]
+        self.pattern.stitch_h_mm = v["h"]
+        self._extra_dirty = True
+        self.statusBar().showMessage(
+            f"Fabric: {v['aida']} ct aida, stitch "
+            f"{v['w']}×{v['h']} mm, canvas "
+            f"{self.pattern.width}×{self.pattern.height} (even counts)")
+
     def canvas_setup(self):
         dlg = CanvasSetupDialog(self.pattern, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            v = dlg.values()
-            self.pattern.aida_count = v["aida"]
-            if v["size_mode"] == "inches":
-                self.pattern.width = max(1, round(v["size_w"] * v["aida"]))
-                self.pattern.height = max(1, round(v["size_h"] * v["aida"]))
-            else:
-                self.pattern.width = max(1, round(v["size_w"]))
-                self.pattern.height = max(1, round(v["size_h"]))
-            # even counts only: keeps the symmetry center on a grid dot
-            self.pattern.width += self.pattern.width % 2
-            self.pattern.height += self.pattern.height % 2
-            self.canvas._update_scene_rect()
-            self.canvas.centerOn(self.canvas.pattern_center_scene())
-            self.canvas.viewport().update()
-            self.pattern.stitch_w_mm = v["w"]
-            self.pattern.stitch_h_mm = v["h"]
-            self._extra_dirty = True
-            self.statusBar().showMessage(
-                f"Fabric: {v['aida']} ct aida, stitch "
-                f"{v['w']}×{v['h']} mm, canvas "
-                f"{self.pattern.width}×{self.pattern.height} (even counts)")
+            self._apply_canvas_values(dlg.values())
+            self._save_canvas_settings()
 
     def _on_color_changed(self, spec):
         self.canvas.current_color = spec
@@ -618,20 +694,97 @@ class MainWindow(QMainWindow):
             self._update_status()
 
     def _on_place_block(self, block, scope, gx, gy, anchor,
-                        rot=0, mx=False, my=False):
-        self._place_block_at(block, scope, gx, gy, anchor, rot, mx, my)
+                        rot=0, mx=False, my=False, array=None):
+        self._place_block_at(block, scope, gx, gy, anchor, rot, mx, my,
+                             array)
 
     def _on_library_place(self, payload):
         block, scope = payload
         self.canvas.set_pending_block(block, scope)
         self._set_tool(Tool.BLOCK)
         self.canvas.setFocus()   # placement keys (R/F/V/1-9) go to canvas
+        arr = ""
+        if self.canvas.array_armed and (self.canvas.array_rows > 1
+                                        or self.canvas.array_cols > 1):
+            arr = (f" Array {self.canvas.array_rows}x"
+                   f"{self.canvas.array_cols} gap "
+                   f"{self.canvas.array_dx},{self.canvas.array_dy}"
+                   " — one placement, then back to single."
+                   " (Array… to change.)")
         self.statusBar().showMessage(
             f"Click to place '{block.name}' ({scope}). "
-            "1-9 anchor, R rotate, F/V flip, right-click done.")
+            "1-9 anchor, R rotate, F/V flip, right-click done." + arr)
+
+    def _array_dialog(self):
+        """Configure rows/cols/spacing for block array placement."""
+        c = self.canvas
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Block array")
+        form = QFormLayout(dlg)
+        rows = QSpinBox(); rows.setRange(1, 50)
+        cols = QSpinBox(); cols.setRange(1, 50)
+        dx = QSpinBox(); dx.setRange(-500, 500)
+        dy = QSpinBox(); dy.setRange(-500, 500)
+        centered = QCheckBox("Center array on click")
+        s = self._settings
+        rows.setValue(s.value("block/array_rows", c.array_rows, int))
+        cols.setValue(s.value("block/array_cols", c.array_cols, int))
+        dx.setValue(s.value("block/array_dx",
+                            c.array_dx if c.array_dx else 1, int))
+        dy.setValue(s.value("block/array_dy",
+                            c.array_dy if c.array_dy else 1, int))
+        centered.setChecked(
+            s.value("block/array_centered", c.array_centered, bool))
+        form.addRow("Rows", rows)
+        form.addRow("Columns", cols)
+        form.addRow("Gap X (stitches)", dx)
+        form.addRow("Gap Y (stitches)", dy)
+        form.addRow(centered)
+        hint = QLabel("Gap is the empty space between block edges "
+                      "(0 = touching, negative = overlap).")
+        hint.setWordWrap(True)
+        form.addRow(hint)
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                               QDialogButtonBox.StandardButton.Cancel)
+        box.accepted.connect(dlg.accept)
+        box.rejected.connect(dlg.reject)
+        form.addRow(box)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        c.array_rows, c.array_cols = rows.value(), cols.value()
+        c.array_dx, c.array_dy = dx.value(), dy.value()
+        c.array_centered = centered.isChecked()
+        # array applies to the next placement only (one-shot)
+        c.array_armed = rows.value() > 1 or cols.value() > 1
+        for k, v in (("block/array_rows", c.array_rows),
+                     ("block/array_cols", c.array_cols),
+                     ("block/array_dx", c.array_dx),
+                     ("block/array_dy", c.array_dy),
+                     ("block/array_centered", c.array_centered)):
+            s.setValue(k, v)
+        c._update_tool_label()
+        c.viewport().update()
+        if c.array_armed:
+            self.statusBar().showMessage(
+                f"Array armed: {c.array_rows}x{c.array_cols} gap "
+                f"{c.array_dx},{c.array_dy}" +
+                (" centered" if c.array_centered else "") +
+                " — next click places it once.")
+        else:
+            self.statusBar().showMessage("Array cleared (single placement).")
+
+    @staticmethod
+    def _array_offsets(rows, cols, centered):
+        rows, cols = max(1, rows), max(1, cols)
+        if rows == 1 and cols == 1:
+            return [(0, 0)]
+        c0 = -(cols - 1) // 2 if centered else 0
+        r0 = -(rows - 1) // 2 if centered else 0
+        return [(c0 + c, r0 + r)
+                for r in range(rows) for c in range(cols)]
 
     def _place_block_at(self, block, scope, gx, gy, anchor=5,
-                        rot=0, mx=False, my=False):
+                        rot=0, mx=False, my=False, array=None):
         bb = block.bbox() or (0, 0, 0, 0)
         fx, fy = PatternCanvas.PLACE_ANCHORS.get(anchor, (0.5, 0.5))
         ax = int(round(bb[0] + fx * (bb[2] - bb[0])))
@@ -641,22 +794,38 @@ class MainWindow(QMainWindow):
         local = (Transform.translation(-ax, -ay)
                  .then(inner)
                  .then(Transform.translation(ax, ay)))
-        inst = BlockInstance(
-            uid=self.pattern.next_instance_id(),
-            block_id=block.id, scope=scope,
-            transform=local.then(Transform.translation(gx - ax, gy - ay)),
-            linked=True, layer=self.pattern.active_layer)
-        insts = [inst]
-        # live symmetry: mirror the placement into the other quadrant(s)
+        rows, cols, dx, dy, centered = array or (1, 1, 0, 0, False)
+        # spacing is the GAP between block edges: step = placed bbox
+        # size (after rot/mirror) + gap
+        xs, ys = [], []
+        for cx in (bb[0], bb[2]):
+            for cy in (bb[1], bb[3]):
+                px, py = local.apply((cx, cy))
+                xs.append(px); ys.append(py)
+        step_x = int(round(max(xs) - min(xs))) + dx
+        step_y = int(round(max(ys) - min(ys))) + dy
+        insts = []
+        for dc, dr in self._array_offsets(rows, cols, centered):
+            insts.append(BlockInstance(
+                uid=self.pattern.next_instance_id(),
+                block_id=block.id, scope=scope,
+                transform=local.then(Transform.translation(
+                    gx - ax + dc * step_x, gy - ay + dr * step_y)),
+                linked=True, layer=self.pattern.active_layer))
+        # live symmetry: mirror every placed instance into the
+        # other quadrant(s)
         from .core.symmetry import symmetry_matrices
         p = self.pattern
-        for m in symmetry_matrices(self.canvas.symmetry_axes,
+        base = list(insts)
+        for m in symmetry_matrices(self.canvas.active_symmetry_axes,
                                    p.width, p.height):
             mt = Transform(*m)
-            insts.append(BlockInstance(
-                uid=p.next_instance_id(), block_id=block.id, scope=scope,
-                transform=inst.transform.then(mt),
-                linked=True, layer=inst.layer))
+            for inst in base:
+                insts.append(BlockInstance(
+                    uid=p.next_instance_id(), block_id=block.id,
+                    scope=scope,
+                    transform=inst.transform.then(mt),
+                    linked=True, layer=inst.layer))
         self.undo_stack.push(PlaceBlockCommand(self.pattern, insts))
         self.canvas.refresh()
         self._update_status()
@@ -780,11 +949,11 @@ class MainWindow(QMainWindow):
 
     def _sym_ops(self):
         """Live symmetry transforms ([] when symmetry is off)."""
-        if not self.canvas.symmetry_axes:
+        if not self.canvas.active_symmetry_axes:
             return []
         from .core.symmetry import symmetry_matrices
         return [Transform(*m) for m in symmetry_matrices(
-            self.canvas.symmetry_axes, self.pattern.width,
+            self.canvas.active_symmetry_axes, self.pattern.width,
             self.pattern.height)]
 
     def _on_move_selection(self, dx, dy):
@@ -983,6 +1152,14 @@ class MainWindow(QMainWindow):
         # re-scope existing instances? leave as project; new placements use global
         self._refresh_all()
 
+    def _on_block_folder(self, block, scope, folder):
+        block.folder = folder
+        if scope == "global":
+            self.library.save()
+        else:
+            self._extra_dirty = True
+        self._refresh_all()
+
     # ------------------------------------------------------------- files
     def _confirm_discard(self, action):
         """Prompt to save if dirty. Returns True if it's OK to proceed
@@ -1011,7 +1188,16 @@ class MainWindow(QMainWindow):
     def new_project(self):
         if not self._confirm_discard("starting a new project"):
             return
-        self.pattern = Pattern()
+        # build the new pattern from persisted canvas defaults and let
+        # the user confirm/adjust before it replaces the current doc
+        trial = Pattern()
+        self._load_canvas_defaults(trial)
+        dlg = CanvasSetupDialog(trial, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.pattern = trial
+        self._apply_canvas_values(dlg.values())
+        self._save_canvas_settings()
         self._file_path = None
         self._extra_dirty = False
         self._saved_index = 0
@@ -1247,6 +1433,7 @@ class MainWindow(QMainWindow):
         self._settings.setValue(
             "ui/panel_visibility",
             [act.isChecked() for act, _ in self._panel_acts])
+        self._save_canvas_settings()
         if not self._confirm_discard("closing"):
             event.ignore()
             return
