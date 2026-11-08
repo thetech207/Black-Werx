@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import enum
 import itertools
+import math
 import uuid
 from dataclasses import dataclass, field, replace
 
@@ -97,14 +98,23 @@ class Stitch:
             return [self.a]
         pa, pb = self.endpoints()
         (x1, y1), (x2, y2) = pa, pb
+        span = max(abs(x2 - x1), abs(y2 - y1))
+        steps = max(int(math.ceil(span * 4)), 1)
         cells = []
-        # walk the line and collect cells it passes through
-        steps = max(abs(x2 - x1), abs(y2 - y1), 1)
+        # densely sample the drawn segment; each sample contributes the
+        # cell containing it, plus the cell on the far side when the
+        # sample sits exactly on a grid line (so lines are erasable from
+        # either adjacent row/column)
         for i in range(steps + 1):
             t = i / steps
-            cx = round(x1 + (x2 - x1) * t)
-            cy = round(y1 + (y2 - y1) * t)
-            cells.append((cx, cy))
+            x = x1 + (x2 - x1) * t
+            y = y1 + (y2 - y1) * t
+            fx, fy = math.floor(x), math.floor(y)
+            cells.append((fx, fy))
+            if abs(x - round(x)) < 1e-6:
+                cells.append((int(round(x)) - 1, fy))
+            if abs(y - round(y)) < 1e-6:
+                cells.append((fx, int(round(y)) - 1))
         # dedupe preserving order
         seen, out = set(), []
         for c in cells:
@@ -272,6 +282,11 @@ def transform_stitch(s: Stitch, t: "Transform") -> Stitch:
 
 
 Transform.IDENTITY = Transform()
+
+# Non-printing design margin (in cells) around the fabric on every side.
+# Stitches may be placed in [-WORKSPACE, width+WORKSPACE] — handy for
+# staging blocks/elements — but exports clip to the fabric itself.
+WORKSPACE = 100
 
 
 @dataclass

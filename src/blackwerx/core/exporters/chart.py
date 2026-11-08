@@ -33,12 +33,76 @@ class ChartItem:
     hex_color: str
 
 
+def _clip_seg_rect(p1, p2, x0, y0, x1, y1):
+    """Liang-Barsky clip of segment p1->p2 to rect [x0,x1]x[y0,y1].
+    Returns (q1, q2) or None if no intersection."""
+    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, p1[0] - x0), (dx, x1 - p1[0]),
+                 (-dy, p1[1] - y0), (dy, y1 - p1[1])):
+        if p == 0:
+            if q < 0:
+                return None
+        else:
+            r = q / p
+            if p < 0:
+                if r > t1:
+                    return None
+                t0 = max(t0, r)
+            else:
+                if r < t0:
+                    return None
+                t1 = min(t1, r)
+    if t0 > t1:
+        return None
+    return ((p1[0] + t0 * dx, p1[1] + t0 * dy),
+            (p1[0] + t1 * dx, p1[1] + t1 * dy))
+
+
+def stitch_on_fabric(s: Stitch, width: int, height: int) -> Stitch | None:
+    """Clip a stitch to the fabric rect [0,width]x[0,height].
+
+    Returns the (possibly clipped) stitch, or None if it lies entirely
+    in the non-printing workspace. X cells are atomic — a cell is either
+    on the fabric or not; backstitch segments are clipped at the edge.
+    """
+    if s.kind is StitchKind.X:
+        return s if 0 <= s.a[0] < width and 0 <= s.a[1] < height else None
+    pa, pb = s.endpoints()
+    # fully inside (rect is convex) -> keep the stitch untouched so
+    # trimmed (half) stitches keep their fractions
+    if (0 <= pa[0] <= width and 0 <= pa[1] <= height
+            and 0 <= pb[0] <= width and 0 <= pb[1] <= height):
+        return s
+    clipped = _clip_seg_rect(pa, pb, 0.0, 0.0, float(width), float(height))
+    if clipped is None:
+        return None
+    q1, q2 = clipped
+    if q1 == q2:
+        return None
+    # clipped portion of the *drawn* segment becomes a full segment;
+    # endpoints may be fractional, so bypass Stitch's int normalization
+    from dataclasses import replace
+    c = replace(s, a=(0, 0), b=(1, 1), ta=0.0, tb=1.0)
+    object.__setattr__(c, "a", q1)
+    object.__setattr__(c, "b", q2)
+    return c
+
+
 def collect_stitches(pattern: Pattern,
                      library_blocks: dict | None = None) -> list[Stitch]:
-    """All effective stitches: raw pattern stitches + resolved instances."""
-    out = list(pattern.stitches.values())
+    """All effective stitches on the fabric: raw stitches + resolved
+    block instances, clipped to the printable area (workspace excluded)."""
+    out = []
+    for s in list(pattern.stitches.values()):
+        c = stitch_on_fabric(s, pattern.width, pattern.height)
+        if c is not None:
+            out.append(c)
     for inst in pattern.instances:
-        out.extend(inst.resolve(pattern.blocks, library_blocks))
+        for s in inst.resolve(pattern.blocks, library_blocks):
+            c = stitch_on_fabric(s, pattern.width, pattern.height)
+            if c is not None:
+                out.append(c)
     return out
 
 

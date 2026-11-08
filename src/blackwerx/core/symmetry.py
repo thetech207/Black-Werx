@@ -14,7 +14,7 @@ mirrors both kinds correctly.
 
 from __future__ import annotations
 
-from .model import Stitch, Transform, transform_stitch
+from .model import Stitch, Transform, transform_stitch, WORKSPACE
 
 AXES = ("h", "v", "d", "ad")
 
@@ -66,7 +66,9 @@ def symmetry_matrices(axes, width: int, height: int) -> list:
 
 
 def _in_bounds(s: Stitch, width: int, height: int) -> bool:
-    return all(0 <= x <= width and 0 <= y <= height
+    # mirrors may land in the non-printing workspace — keep them
+    ws = WORKSPACE
+    return all(-ws <= x <= width + ws and -ws <= y <= height + ws
                for x, y in s.extent_points())
 
 

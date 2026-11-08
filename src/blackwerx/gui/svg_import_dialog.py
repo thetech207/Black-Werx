@@ -5,11 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QImage, QPainter, QColor, QFont
+from PySide6.QtGui import QImage, QPainter, QColor, QFont, QPixmap
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
                                QComboBox, QSpinBox, QSlider, QLabel,
                                QPushButton, QCheckBox, QFileDialog,
-                               QDialogButtonBox, QScrollArea)
+                               QDialogButtonBox, QWidget, QLayout)
 
 from ..core import svg_import, palette
 from ..core.model import Pattern, Stitch
@@ -18,8 +18,9 @@ from ..core.model import Pattern, Stitch
 class SvgImportDialog(QDialog):
     """Convert an SVG to stitches with adjustable accuracy and preview."""
 
-    def __init__(self, parent=None):
+    def __init__(self, pattern=None, parent=None):
         super().__init__(parent)
+        self.pattern = pattern
         self.setWindowTitle("Import SVG")
         self.resize(900, 640)
         self.result = None
@@ -28,8 +29,9 @@ class SvgImportDialog(QDialog):
 
         root = QHBoxLayout(self)
 
-        # ---- controls ----
+        # ---- controls (fixed width, no scrolling) ----
         left = QVBoxLayout()
+        left.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
         row = QHBoxLayout()
         self.file_label = QLabel("No file selected")
         row.addWidget(self.file_label, 1)
@@ -40,20 +42,21 @@ class SvgImportDialog(QDialog):
 
         form = QFormLayout()
         self.mode = QComboBox()
-        self.mode.addItems(["fill (X-stitches)", "outline (backstitches)"])
+        self.mode.addItems(["fill (X-stitches)", "outline (backstitches)",
+                            "fill + outline"])
         self.mode.currentIndexChanged.connect(self._update_preview)
         form.addRow("Mode", self.mode)
 
         self.width_spin = QSpinBox()
         self.width_spin.setRange(1, 2000)
         self.width_spin.setValue(100)
-        self.width_spin.valueChanged.connect(self._sync_height)
+        self.width_spin.editingFinished.connect(self._sync_height)
         form.addRow("Grid width (stitches)", self.width_spin)
 
         self.height_spin = QSpinBox()
         self.height_spin.setRange(1, 2000)
         self.height_spin.setValue(100)
-        self.height_spin.valueChanged.connect(self._update_preview)
+        self.height_spin.editingFinished.connect(self._update_preview)
         form.addRow("Grid height", self.height_spin)
 
         self.threshold = QSlider(Qt.Orientation.Horizontal)
@@ -65,13 +68,13 @@ class SvgImportDialog(QDialog):
         self.smooth = QSpinBox()
         self.smooth.setRange(0, 5)
         self.smooth.setValue(0)
-        self.smooth.valueChanged.connect(self._update_preview)
+        self.smooth.editingFinished.connect(self._update_preview)
         form.addRow("Smoothing passes", self.smooth)
 
         self.minsize = QSpinBox()
         self.minsize.setRange(0, 8)
         self.minsize.setValue(1)
-        self.minsize.valueChanged.connect(self._update_preview)
+        self.minsize.editingFinished.connect(self._update_preview)
         form.addRow("Min neighbors (despeckle)", self.minsize)
 
         self.color_mode = QComboBox()
@@ -86,6 +89,13 @@ class SvgImportDialog(QDialog):
         self.as_block = QCheckBox("Import as block (instead of raw stitches)")
         form.addRow(self.as_block)
 
+        self.fit_canvas = QCheckBox(
+            "Expand canvas to fit imported size")
+        self.fit_canvas.setChecked(True)
+        self.fit_canvas.setToolTip(
+            "Grow the pattern's width/height if the import is larger")
+        form.addRow(self.fit_canvas)
+
         left.addLayout(form)
 
         info = QLabel("")
@@ -99,13 +109,12 @@ class SvgImportDialog(QDialog):
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         left.addWidget(buttons)
+        left.addStretch()
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        wrap = QWidget()
-        wrap.setLayout(left)
-        scroll.setWidget(wrap)
-        root.addWidget(scroll, 1)
+        left_widget = QWidget()
+        left_widget.setLayout(left)
+        left_widget.setFixedWidth(280)
+        root.addWidget(left_widget)
 
         # ---- preview ----
         self.preview_label = QLabel("Select an SVG file to preview")
@@ -130,9 +139,9 @@ class SvgImportDialog(QDialog):
 
     # -- params ---------------------------------------------------------
     def _mode_str(self):
-        return "fill" if self.mode.currentIndex() == 0 else "outline"
+        return ("fill", "outline", "both")[self.mode.currentIndex()]
 
-    def _sync_height(self, w):
+    def _sync_height(self, *_):
         # keep aspect if svg known? just update preview
         self._update_preview()
 
@@ -182,14 +191,13 @@ class SvgImportDialog(QDialog):
         img.fill(QColor("#F5F0E6"))
         painter = QPainter(img)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        ox = 10 - bounds[0] * cell
-        oy = 10 - bounds[1] * cell
+        ox = oy = 10.0  # draw_chart X() already offsets by -minx/-miny
         draw_chart(painter, items, cell, ox, oy, realistic=True, bounds=bounds)
         painter.end()
-        self.preview_label.setPixmap(
-            img.scaled(self.preview_label.size() * 0.9,
-                       Qt.AspectRatioMode.KeepAspectRatio,
-                       Qt.TransformationMode.SmoothTransformation))
+        self.preview_label.setPixmap(QPixmap.fromImage(img.scaled(
+            self.preview_label.size() * 0.9,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)))
 
     # -- accept -----------------------------------------------------------
     def _on_accept(self):

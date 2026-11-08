@@ -102,24 +102,32 @@ def _smooth(covered: set[tuple[int, int]], passes: int = 0) -> set:
     return cur
 
 
-def _boundary_segments(covered: set[tuple[int, int]]):
-    """Extract boundary edges as (orientation, fixed, start, end) segments."""
-    # vertical edges keyed by X coord; horizontal edges keyed by Y coord
-    verts: dict[int, set[int]] = {}
-    hors: dict[int, set[int]] = {}
+def _spec_for(cell, colors, color_mode, default_color):
+    if color_mode == "preserve" and cell in colors:
+        r, g, b = colors[cell]
+        return f"#{r:02x}{g:02x}{b:02x}"
+    return default_color
+
+
+def _boundary_segments(covered, spec_of):
+    """Extract boundary edges: verts/hors map fixed coord ->
+    color spec -> set of positions along that edge."""
+    verts: dict[int, dict[str, set[int]]] = {}
+    hors: dict[int, dict[str, set[int]]] = {}
     for x, y in covered:
+        spec = spec_of((x, y))
         # left side: vertical segment X=x, y..y+1
         if (x - 1, y) not in covered:
-            verts.setdefault(x, set()).add(y)
+            verts.setdefault(x, {}).setdefault(spec, set()).add(y)
         # right side: X=x+1
         if (x + 1, y) not in covered:
-            verts.setdefault(x + 1, set()).add(y)
+            verts.setdefault(x + 1, {}).setdefault(spec, set()).add(y)
         # top side: horizontal Y=y, x..x+1
         if (x, y - 1) not in covered:
-            hors.setdefault(y, set()).add(x)
+            hors.setdefault(y, {}).setdefault(spec, set()).add(x)
         # bottom side: Y=y+1
         if (x, y + 1) not in covered:
-            hors.setdefault(y + 1, set()).add(x)
+            hors.setdefault(y + 1, {}).setdefault(spec, set()).add(x)
     return verts, hors
 
 
@@ -134,16 +142,28 @@ def _merge_runs(vals: set[int]):
     return [(a, b) for a, b in runs if b > a]
 
 
-def outline_stitches(covered: set[tuple[int, int]], color: str) -> list[Stitch]:
-    """Boundary of covered cells -> merged backstitches."""
-    verts, hors = _boundary_segments(covered)
+def outline_stitches(covered: set[tuple[int, int]], color: str = "#000",
+                     *, colors: dict | None = None,
+                     color_mode: str = "mono",
+                     default_color: str | None = None) -> list[Stitch]:
+    """Boundary of covered cells -> merged backstitches.
+
+    Each edge takes the color of the covered cell it borders when
+    color_mode == "preserve" and colors are provided; otherwise `color`.
+    """
+    default_color = default_color or color
+    colors = colors or {}
+    spec_of = lambda c: _spec_for(c, colors, color_mode, default_color)
+    verts, hors = _boundary_segments(covered, spec_of)
     out = []
-    for x, ys in verts.items():
-        for a, b in _merge_runs(ys):
-            out.append(Stitch(StitchKind.BACK, (x, a), (x, b), color))
-    for y, xs in hors.items():
-        for a, b in _merge_runs(xs):
-            out.append(Stitch(StitchKind.BACK, (a, y), (b, y), color))
+    for x, bycolor in verts.items():
+        for spec, ys in bycolor.items():
+            for a, b in _merge_runs(ys):
+                out.append(Stitch(StitchKind.BACK, (x, a), (x, b), spec))
+    for y, bycolor in hors.items():
+        for spec, xs in bycolor.items():
+            for a, b in _merge_runs(xs):
+                out.append(Stitch(StitchKind.BACK, (a, y), (b, y), spec))
     return out
 
 
@@ -151,12 +171,8 @@ def fill_stitches(covered: set[tuple[int, int]], colors: dict,
                   color_mode: str, default_color: str) -> list[Stitch]:
     out = []
     for cell in sorted(covered):
-        if color_mode == "preserve" and cell in colors:
-            r, g, b = colors[cell]
-            spec = f"#{r:02x}{g:02x}{b:02x}"
-        else:
-            spec = default_color
-        out.append(Stitch(StitchKind.X, cell, None, spec))
+        out.append(Stitch(StitchKind.X, cell, None,
+                          _spec_for(cell, colors, color_mode, default_color)))
     return out
 
 
@@ -168,16 +184,16 @@ def import_svg(svg_path: str, width: int, height: int, *,
                supersample: int = 4) -> SvgImportResult:
     """Convert an SVG file to stitches on a width×height grid.
 
-    mode: "fill" (X-stitches over covered area) or "outline" (boundary
-          backstitches).
+    mode: "fill" (X-stitches over covered area), "outline" (boundary
+          backstitches), or "both" (fill + outline).
     threshold: 0-255 coverage cutoff per cell.
     smooth_passes: majority-filter iterations to reduce jaggies.
     min_neighbors: despeckle — drop cells with fewer orthogonal neighbors.
     color_mode: "mono" (default_color everywhere) or "preserve" (sampled).
     map_to_dmc: convert preserved colors to nearest DMC spec.
     """
-    if mode not in ("fill", "outline"):
-        raise ValueError("mode must be 'fill' or 'outline'")
+    if mode not in ("fill", "outline", "both"):
+        raise ValueError("mode must be 'fill', 'outline' or 'both'")
     if not (1 <= width <= 2000 and 1 <= height <= 2000):
         raise ValueError("grid size out of range (1..2000)")
 
@@ -186,10 +202,12 @@ def import_svg(svg_path: str, width: int, height: int, *,
     covered = _smooth(covered, smooth_passes)
     covered = _despeckle(covered, min_neighbors)
 
-    if mode == "fill":
-        stitches = fill_stitches(covered, colors, color_mode, default_color)
-    else:
-        stitches = outline_stitches(covered, default_color)
+    stitches = []
+    if mode in ("fill", "both"):
+        stitches += fill_stitches(covered, colors, color_mode, default_color)
+    if mode in ("outline", "both"):
+        stitches += outline_stitches(
+            covered, default_color, colors=colors, color_mode=color_mode)
 
     if map_to_dmc:
         from dataclasses import replace

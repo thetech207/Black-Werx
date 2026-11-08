@@ -38,12 +38,12 @@ def export_pat(pattern: Pattern, path: str | Path, *,
     for s in stitches:
         if s.kind is StitchKind.X:
             # two half stitches approximated as jump + stitch
-            x, y = s.a[0] - minx, s.a[1] - miny
+            x, y = round(s.a[0] - minx), round(s.a[1] - miny)
             lines.append(f"{x + 1:5d}{y + 1:5d} +1")
             lines.append(f"{x + 1:5d}{y + 1:5d} -1")
         else:
-            x1, y1 = s.a[0] - minx + 1, s.a[1] - miny + 1
-            x2, y2 = s.b[0] - minx + 1, s.b[1] - miny + 1
+            x1, y1 = (round(s.a[0] - minx + 1), round(s.a[1] - miny + 1))
+            x2, y2 = (round(s.b[0] - minx + 1), round(s.b[1] - miny + 1))
             # interpolate intermediate points along the line
             steps = max(abs(x2 - x1), abs(y2 - y1), 1)
             for i in range(steps):

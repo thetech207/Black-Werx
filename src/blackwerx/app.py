@@ -121,7 +121,7 @@ class MainWindow(QMainWindow):
             act.triggered.connect(lambda _=False, t=tool: self._set_tool(t))
             tb.addAction(act)
             self.tool_group.append((tool, act))
-        self._set_tool(Tool.PENCIL)
+        self._set_tool(Tool.SELECT)
 
         # symmetry dropdown on the tool bar
         sym_btn = QToolButton(self)
@@ -265,6 +265,7 @@ class MainWindow(QMainWindow):
         self._act(m, "Zoom &In", lambda: self.canvas.zoom_centered(1.25), "Ctrl++")
         self._act(m, "Zoom &Out", lambda: self.canvas.zoom_centered(0.8), "Ctrl+-")
         self._act(m, "&Reset Zoom", self.canvas.resetTransform, "Ctrl+0")
+        self._act(m, "Actual &Size", self.canvas.zoom_actual_size)
         m.addSeparator()
         self.guides_act = QAction("Show &guides", self)
         self.guides_act.setCheckable(True)
@@ -329,7 +330,7 @@ class MainWindow(QMainWindow):
         c.library_blocks = self.library_blocks
         c.current_color = self.color_panel.current_spec
         c.draw_stitches.connect(self._on_draw_stitches)
-        c.erase_cells.connect(self._on_erase_cells)
+        c.erase_keys.connect(self._on_erase_keys)
         c.place_block.connect(self._on_place_block)
         c.move_selection.connect(self._on_move_selection)
         c.rotate_selection.connect(self._on_rotate_selection)
@@ -488,8 +489,12 @@ class MainWindow(QMainWindow):
     def _update_status(self):
         n = self.pattern.stitch_count()
         self.status_info.setText(f"{n} stitches")
+        dirty = " •" if self._is_dirty() else ""
+        name = self.pattern.name
+        if name in ("", "Untitled") and self._file_path is not None:
+            name = self._file_path.stem
         self.setWindowTitle(
-            f"Black-Werx — {self.pattern.name}" +
+            f"Black-Werx — {name}{dirty}" +
             (f" — {self._file_path.name}" if self._file_path else ""))
         self._refresh_sym_warnings()
 
@@ -537,6 +542,7 @@ class MainWindow(QMainWindow):
 
     def _set_tool(self, tool):
         self.canvas.set_tool(tool)
+        self.canvas.setFocus()   # canvas keys (Esc, arrows, R/F/V) need it
         if tool is Tool.BLOCK and self.canvas.pending_block is None:
             self.statusBar().showMessage(
                 "Select a block in the library panel, then click to place.")
@@ -597,15 +603,13 @@ class MainWindow(QMainWindow):
         self.canvas.refresh()
         self._update_status()
 
-    def _on_erase_cells(self, cells):
-        keys = []
-        for c in cells:
-            for s in self.pattern.get_stitches_in_cell(c):
-                if not self.pattern.layer_locked(s.layer) \
-                        and self.pattern.layer_visible(s.layer):
-                    keys.append(s.key)
-        # also erase backstitches passing near cell
-        keys = list(dict.fromkeys(keys))
+    def _on_erase_keys(self, keys):
+        keys = [k for k in keys
+                if k in self.pattern.stitches
+                and not self.pattern.layer_locked(
+                    self.pattern.stitches[k].layer)
+                and self.pattern.layer_visible(
+                    self.pattern.stitches[k].layer)]
         if keys:
             self.undo_stack.push(EraseStitchesCommand(
             self.pattern, keys, selection=self.canvas.selection,
@@ -621,6 +625,7 @@ class MainWindow(QMainWindow):
         block, scope = payload
         self.canvas.set_pending_block(block, scope)
         self._set_tool(Tool.BLOCK)
+        self.canvas.setFocus()   # placement keys (R/F/V/1-9) go to canvas
         self.statusBar().showMessage(
             f"Click to place '{block.name}' ({scope}). "
             "1-9 anchor, R rotate, F/V flip, right-click done.")
@@ -979,7 +984,33 @@ class MainWindow(QMainWindow):
         self._refresh_all()
 
     # ------------------------------------------------------------- files
+    def _confirm_discard(self, action):
+        """Prompt to save if dirty. Returns True if it's OK to proceed
+        (clean, saved, or user chose Don't save); False on Cancel."""
+        import os
+        if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+            return True   # headless/test runs: never block on a dialog
+        if not self._is_dirty():
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle("Unsaved changes")
+        box.setText(f"Save changes before {action}?")
+        save_btn = box.addButton("Save", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Don't save", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == save_btn:
+            if self._file_path is None:
+                self.save_project_as()
+                return self._file_path is not None
+            self.save_project()
+            return True
+        return box.buttonRole(clicked) == QMessageBox.ButtonRole.DestructiveRole
+
     def new_project(self):
+        if not self._confirm_discard("starting a new project"):
+            return
         self.pattern = Pattern()
         self._file_path = None
         self._extra_dirty = False
@@ -1035,12 +1066,16 @@ class MainWindow(QMainWindow):
         self._load_path(path)
 
     def _load_path(self, path):
+        if not self._confirm_discard("opening a project"):
+            return
         try:
             self.pattern = project_io.load_project(path)
         except Exception as e:
             QMessageBox.critical(self, "Open failed", str(e))
             return
         self._file_path = Path(path)
+        if self.pattern.name in ("", "Untitled"):
+            self.pattern.name = self._file_path.stem
         self._add_recent(path)
         self._extra_dirty = False
         self._saved_index = 0
@@ -1068,13 +1103,20 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def _mark_saved(self):
+        if self.pattern.name in ("", "Untitled") \
+                and self._file_path is not None:
+            self.pattern.name = self._file_path.stem
         self._saved_index = self.undo_stack.index()
         self._extra_dirty = False
         if self._file_path is not None:
             self._add_recent(self._file_path)
 
     def import_svg(self):
-        dlg = SvgImportDialog(self)
+        dlg = SvgImportDialog(self.pattern)
+        # Center on the main window, then show as an independent
+        # top-level window so dragging it can't move the app window.
+        c = self.geometry().center()
+        dlg.move(c.x() - dlg.width() // 2, c.y() - dlg.height() // 2)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             r = dlg.get_result()
             if r is None:
@@ -1083,6 +1125,16 @@ class MainWindow(QMainWindow):
             # place at center of current view-ish: offset so result centered
             # on pattern; simple: place at (2,2)
             ox, oy = 2, 2
+            if dlg.fit_canvas.isChecked():
+                need_w = ox + r.width
+                need_h = oy + r.height
+                if need_w > self.pattern.width or need_h > self.pattern.height:
+                    self.pattern.width = need_w + need_w % 2
+                    self.pattern.height = need_h + need_h % 2
+                    self.canvas._update_scene_rect()
+                    self.canvas.centerOn(self.canvas.pattern_center_scene())
+                    self.canvas.viewport().update()
+                    self._extra_dirty = True
             stitches = [replace(
                 s, a=(s.a[0] + ox, s.a[1] + oy),
                 b=((s.b[0] + ox, s.b[1] + oy) if s.b else None),
@@ -1195,30 +1247,7 @@ class MainWindow(QMainWindow):
         self._settings.setValue(
             "ui/panel_visibility",
             [act.isChecked() for act, _ in self._panel_acts])
-        import os
-        if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
-            event.accept()   # headless/test runs: never block on a dialog
-            return
-        if not self._is_dirty():
-            event.accept()
-            return
-        box = QMessageBox(self)
-        box.setWindowTitle("Unsaved changes")
-        box.setText("Save changes before closing?")
-        save_btn = box.addButton("Save", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("Don't save", QMessageBox.ButtonRole.DestructiveRole)
-        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked == save_btn:
-            if self._file_path is None:
-                self.save_project_as()
-                if self._file_path is None:
-                    event.ignore()
-                    return
-            else:
-                self.save_project()
-        elif box.buttonRole(clicked) != QMessageBox.ButtonRole.DestructiveRole:
+        if not self._confirm_discard("closing"):
             event.ignore()
             return
         event.accept()

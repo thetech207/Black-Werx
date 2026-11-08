@@ -33,7 +33,14 @@ class BlockEditorDialog(QDialog):
         self.resize(700, 500)
 
         # ---- scratch pattern sized to content ----
-        bb = block.bbox() or (0, 0, 10, 10)
+        # bbox coords can be fractional (trimmed stitches) — snap to ints
+        bb = block.bbox()
+        if bb is None:
+            bb = (0, 0, 10, 10)
+        else:
+            import math
+            bb = (math.floor(bb[0]), math.floor(bb[1]),
+                  math.ceil(bb[2]), math.ceil(bb[3]))
         w = bb[2] - bb[0] + 1 + 2 * self.PAD
         h = bb[3] - bb[1] + 1 + 2 * self.PAD
         self.offset = (bb[0] - self.PAD, bb[1] - self.PAD)
@@ -70,11 +77,11 @@ class BlockEditorDialog(QDialog):
         self.canvas.current_color = "#000000"
 
         self.canvas.draw_stitches.connect(self._on_draw)
-        self.canvas.erase_cells.connect(self._on_erase)
+        self.canvas.erase_keys.connect(self._on_erase)
         layout.addWidget(self.canvas)
 
         toolbar = QHBoxLayout()
-        for tool, label in [(Tool.PENCIL, "Stitch"), (Tool.BACKSTITCH, "Backstitch"),
+        for tool, label in [(Tool.PENCIL, "X Stitch"), (Tool.BACKSTITCH, "Backstitch"),
                             (Tool.ERASER, "Eraser"), (Tool.PAN, "Pan")]:
             b = QPushButton(label)
             b.setCheckable(True)
@@ -106,11 +113,8 @@ class BlockEditorDialog(QDialog):
         self.undos.push(cmd)
         self.canvas.refresh()
 
-    def _on_erase(self, cells):
-        keys = []
-        for c in cells:
-            for s in self.pattern.get_stitches_in_cell(c):
-                keys.append(s.key)
+    def _on_erase(self, keys):
+        keys = [k for k in keys if k in self.pattern.stitches]
         if keys:
             self.undos.push(EraseStitchesCommand(self.pattern, keys))
             self.canvas.refresh()
