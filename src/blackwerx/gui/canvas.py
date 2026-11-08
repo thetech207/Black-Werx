@@ -402,16 +402,16 @@ class PatternCanvas(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         # high-contrast scrollbars: light track, dark chunky handle
         self.setStyleSheet("""
-            QScrollBar:vertical { background:#dcdcdc; width:14px;
-                                  margin:0px; border-left:1px solid #bbb; }
+            QScrollBar:vertical { background:#e7e0d0; width:14px;
+                                  margin:0px; border-left:1px solid #cfc6b0; }
             QScrollBar::handle:vertical { background:#5a5a5a;
                                           min-height:28px; border-radius:4px;
                                           margin:2px; }
             QScrollBar::handle:vertical:hover { background:#333; }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 height:0px; }
-            QScrollBar:horizontal { background:#dcdcdc; height:14px;
-                                    margin:0px; border-top:1px solid #bbb; }
+            QScrollBar:horizontal { background:#e7e0d0; height:14px;
+                                    margin:0px; border-top:1px solid #cfc6b0; }
             QScrollBar::handle:horizontal { background:#5a5a5a;
                                             min-width:28px;
                                             border-radius:4px; margin:2px; }

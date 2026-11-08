@@ -7,15 +7,18 @@ from pathlib import Path
 
 from dataclasses import replace
 
-from PySide6.QtCore import Qt, QSize, QSettings
-from PySide6.QtGui import QAction, QKeySequence, QColor, QIcon, QPixmap
+from PySide6.QtCore import (Qt, QSize, QSettings, QPointF, QEvent,
+                            QPoint, QTimer, QRect)
+from PySide6.QtGui import (QAction, QKeySequence, QColor, QIcon, QPixmap,
+                           QPainter, QPen, QBrush, QPolygonF, QPalette)
 from PySide6.QtWidgets import (QMainWindow, QApplication, QWidget,
                                QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
                                QToolBar, QDockWidget, QFileDialog,
                                QMessageBox, QInputDialog, QDialog,
                                QFormLayout, QComboBox, QCheckBox, QSpinBox,
                                QDoubleSpinBox, QDialogButtonBox, QMenu,
-                               QSplitter, QToolButton, QPushButton)
+                               QSplitter, QToolButton, QPushButton,
+                               QSplashScreen)
 from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import QUndoView
 
@@ -46,6 +49,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Black-Werx")
         self.resize(1200, 800)
         self._settings = QSettings("BlackWerx", "BlackWerx")
+        # capture the OS palette before any override so "System" can
+        # restore it later
+        self._system_palette = QApplication.palette()
+        self._apply_palette()
 
         self.pattern = Pattern()
         self._load_canvas_defaults(self.pattern)
@@ -76,10 +83,18 @@ class MainWindow(QMainWindow):
         grid.setSpacing(0)
 
         self.canvas = PatternCanvas(self)
+        self.canvas.line_width = int(
+            self._settings.value("canvas/line_width", 1))
         corner = QLabel("")
         corner.setFixedSize(22, 22)
-        corner.setStyleSheet("background:#ececec; border-right:1px solid #bbb;"
-                             " border-bottom:1px solid #bbb;")
+        self._corner = corner
+        _pal = self.palette()
+        corner.setStyleSheet(
+            f"background:{_pal.color(QPalette.ColorRole.Window).name()};"
+            f" border-right:1px solid "
+            f"{_pal.color(QPalette.ColorRole.Mid).name()};"
+            f" border-bottom:1px solid "
+            f"{_pal.color(QPalette.ColorRole.Mid).name()};")
         self.h_ruler = Ruler(self.canvas, Qt.Orientation.Horizontal)
         self.v_ruler = Ruler(self.canvas, Qt.Orientation.Vertical)
         grid.addWidget(corner, 0, 0)
@@ -105,8 +120,12 @@ class MainWindow(QMainWindow):
         # left tool sidebar
         tb = QToolBar("Tools")
         tb.setObjectName("Tools")
-        tb.setIconSize(QSize(22, 22))
+        tb.setIconSize(QSize(28, 28))
+        tb.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonIconOnly)
         tb.setMovable(False)
+        tb.setStyleSheet(self._bar_qss("Tools", "right"))
+        self._tools_bar = tb
         self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, tb)
         self.tool_group = []
         tool_tips = {
@@ -131,7 +150,7 @@ class MainWindow(QMainWindow):
             (Tool.ROTATE, "Rotate"),
             (Tool.BLOCK, "Place Block"), (Tool.PAN, "Pan"),
         ]:
-            act = QAction(label, self)
+            act = QAction(_tool_icon(tool), label, self)
             act.setCheckable(True)
             act.setToolTip(tool_tips[tool])
             act.triggered.connect(lambda _=False, t=tool: self._set_tool(t))
@@ -141,12 +160,13 @@ class MainWindow(QMainWindow):
 
         # symmetry dropdown on the tool bar
         sym_btn = QToolButton(self)
+        sym_btn.setIcon(_symmetry_icon())
         sym_btn.setText("Symmetry")
         sym_btn.setToolTip(
             "Symmetry — mirror new stitches and edits across axes")
         sym_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         sym_btn.setToolButtonStyle(
-            Qt.ToolButtonStyle.ToolButtonTextOnly)
+            Qt.ToolButtonStyle.ToolButtonIconOnly)
         sym_menu = QMenu(sym_btn)
         self._sym_btn = sym_btn
         self.sym_on_action = QAction("Enabled", self)
@@ -168,26 +188,96 @@ class MainWindow(QMainWindow):
         sym_btn.setMenu(sym_menu)
         tb.addWidget(sym_btn)
 
-        # options bar (top): line width
-        otb = QToolBar("Options")
-        otb.setObjectName("Options")
+        # edit bar (top): zoom + block/edit commands
+        otb = QToolBar("Edit")
+        otb.setObjectName("EditBar")
         otb.setMovable(False)
+        otb.setIconSize(QSize(20, 20))
+        otb.setStyleSheet(self._bar_qss("EditBar", "bottom"))
+        self._edit_bar = otb
         self.addToolBar(otb)
-        otb.addWidget(QLabel("Line width:"))
-        self.width_spin = QSpinBox()
-        self.width_spin.setRange(1, 12)
-        self.width_spin.setValue(1)
-        self.width_spin.setToolTip("X Line thickness in stitches")
-        self.width_spin.valueChanged.connect(
-            lambda v: setattr(self.canvas, "line_width", v))
-        otb.addWidget(self.width_spin)
+
+        self._edit_btns = []
+
+        def ebtn(icon, text, tip, fn=None, menu=None):
+            b = QToolButton(self)
+            b.setIcon(_edit_icon(icon))
+            self._edit_btns.append((icon, b))
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            if menu is not None:
+                b.setPopupMode(
+                    QToolButton.ToolButtonPopupMode.InstantPopup)
+                b.setMenu(menu)
+            else:
+                b.clicked.connect(fn)
+            otb.addWidget(b)
+            return b
+
+        # -- zoom -----------------------------------------------------
+        ebtn("zoomin", "Zoom In",
+             "Zoom in 25%  (Ctrl++)",
+             lambda: self.canvas.zoom_centered(1.25))
+        ebtn("zoomout", "Zoom Out",
+             "Zoom out 20%  (Ctrl+-)",
+             lambda: self.canvas.zoom_centered(0.8))
+        ebtn("actual", "Actual Size",
+             "Zoom so one stitch equals its real-world size "
+             "on this display", self.canvas.zoom_actual_size)
         otb.addSeparator()
-        self.array_btn = QPushButton("Array…")
+
+        # -- blocks ---------------------------------------------------
+        ebtn("newblock", "New Block",
+             "Create a block from the current selection",
+             self.new_block_from_selection)
+        ebtn("explode_flat", "Explode",
+             "Explode selected block instance(s): flatten to plain "
+             "stitches", lambda: self.explode_selected("flatten"))
+        ebtn("explode_unlink", "Unlink",
+             "Explode selected block instance(s): keep as independent "
+             "editable block copies",
+             lambda: self.explode_selected("unlink"))
+        self.array_btn = QToolButton(self)
+        self.array_btn.setIcon(_edit_icon("array"))
+        self._edit_btns.append(("array", self.array_btn))
+        self.array_btn.setText("Array…")
         self.array_btn.setToolTip(
-            "Place blocks in a rows×columns array with spacing")
+            "Place blocks in a rows×columns array with edge gaps")
+        self.array_btn.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.array_btn.clicked.connect(self._array_dialog)
         self.array_btn.setEnabled(False)
         otb.addWidget(self.array_btn)
+        otb.addSeparator()
+
+        # -- selection edits ------------------------------------------
+        ebtn("dup", "Duplicate",
+             "Duplicate the selection  (Ctrl+D)",
+             self.duplicate_selection)
+        rot_menu = QMenu(self)
+        for deg in (90, 180, 270):
+            rot_menu.addAction(
+                f"{deg}°",
+                lambda _=False, d=deg: self.transform_instances(
+                    f"rot{d}"))
+        ebtn("rot", "Rotate", "Rotate selection 90/180/270°",
+             menu=rot_menu)
+        flip_menu = QMenu(self)
+        flip_menu.addAction(
+            "Horizontal", lambda: self.transform_instances("flipx"))
+        flip_menu.addAction(
+            "Vertical", lambda: self.transform_instances("flipy"))
+        ebtn("flipx", "Flip", "Flip selection horizontally/vertically",
+             menu=flip_menu)
+        ebtn("split", "Split Stitch",
+             "Split the selected stitch(es) in half",
+             self.split_selection)
+        ebtn("hide", "Hide Behind",
+             "Hide selected stitches behind the closed shape "
+             "surrounding them", self.clip_behind_selection)
+        otb.addSeparator()
 
         # undo view dock
         self.undo_view = QUndoView(self.undo_stack)
@@ -205,6 +295,8 @@ class MainWindow(QMainWindow):
         self.layer_panel = LayerPanel()
         self.library_panel = LibraryPanel()
         self.right_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.right_splitter.setHandleWidth(6)
+        self.right_splitter.setChildrenCollapsible(False)
         self.right_splitter.addWidget(self.color_panel)
         self.right_splitter.addWidget(self.layer_panel)
         self.right_splitter.addWidget(self.library_panel)
@@ -212,6 +304,8 @@ class MainWindow(QMainWindow):
         self.right_splitter.setStretchFactor(1, 0)
         self.right_splitter.setStretchFactor(2, 1)
         rlay.addWidget(self.right_splitter)
+        rlay.setContentsMargins(5, 5, 5, 5)
+        rlay.setSpacing(4)
         rdock = QDockWidget("Palette & Library", self)
         rdock.setObjectName("SideDock")
         rdock.setWidget(right)
@@ -221,6 +315,27 @@ class MainWindow(QMainWindow):
             QDockWidget.DockWidgetFeature.DockWidgetFloatable)
         self.right_dock = rdock
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, rdock)
+
+        # compact, rounded, theme-matched styling for the side panel
+        self._side_panel = right
+        right.setObjectName("SidePanel")
+        right.setStyleSheet(self._side_panel_qss())
+
+        # collapse tab on the panel's left edge (child of main window so
+        # it survives the dock being hidden)
+        self._central = central
+        self._dock_w = None
+        self.panel_tab = QToolButton(self)
+        self.panel_tab.setFixedSize(12, 72)
+        self.panel_tab.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.panel_tab.setToolTip(
+            "Collapse/expand the palette & library panel")
+        self.panel_tab.clicked.connect(self._toggle_right_panel)
+        self.panel_tab.setStyleSheet(self._panel_tab_qss())
+        central.installEventFilter(self)
+        self._position_panel_tab()
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._position_panel_tab)
 
         geo = self._settings.value("ui/geometry")
         if geo:
@@ -238,6 +353,196 @@ class MainWindow(QMainWindow):
         self._refresh_rulers()
         self.status_info = QLabel("0 stitches")
         self.statusBar().addPermanentWidget(self.status_info)
+
+    # -- theme ----------------------------------------------------------
+    def _theme_palette(self, mode: str):
+        """Build a QPalette for 'light'/'dark'; 'system' restores OS."""
+        if mode == "system":
+            return self._system_palette
+        p = QPalette()
+        if mode == "dark":
+            win, base, alt = "#2e2b27", "#24211d", "#38342e"
+            text, btn, hi = "#ece7dc", "#3a362f", "#4a7ab5"
+        else:
+            win, base, alt = "#f4f1ea", "#fdfcf8", "#ece8dd"
+            text, btn, hi = "#2b261e", "#e7e2d5", "#3d6fb4"
+        p.setColor(QPalette.ColorRole.Window, QColor(win))
+        p.setColor(QPalette.ColorRole.WindowText, QColor(text))
+        p.setColor(QPalette.ColorRole.Base, QColor(base))
+        p.setColor(QPalette.ColorRole.AlternateBase, QColor(alt))
+        p.setColor(QPalette.ColorRole.Text, QColor(text))
+        p.setColor(QPalette.ColorRole.Button, QColor(btn))
+        p.setColor(QPalette.ColorRole.ButtonText, QColor(text))
+        p.setColor(QPalette.ColorRole.Highlight, QColor(hi))
+        p.setColor(QPalette.ColorRole.HighlightedText,
+                   QColor("#ffffff"))
+        p.setColor(QPalette.ColorRole.Mid, QColor(text).darker(130))
+        p.setColor(QPalette.ColorRole.PlaceholderText,
+                   QColor(text).darker(140))
+        return p
+
+    def _apply_palette(self):
+        mode = self._settings.value("ui/theme", "system")
+        QApplication.setPalette(self._theme_palette(mode))
+
+    def _set_theme(self, mode: str):
+        self._settings.setValue("ui/theme", mode)
+        for md, act in getattr(self, "_theme_acts", {}).items():
+            act.setChecked(md == mode)
+        self._apply_palette()
+        # rebuild every stylesheet that baked in palette colors
+        if hasattr(self, "_tools_bar"):
+            self._tools_bar.setStyleSheet(self._bar_qss("Tools", "right"))
+            self._edit_bar.setStyleSheet(self._bar_qss("EditBar", "bottom"))
+            _ap = QApplication.palette()
+            self._corner.setStyleSheet(
+                f"background:{_ap.color(QPalette.ColorRole.Window).name()};"
+                f" border-right:1px solid "
+                f"{_ap.color(QPalette.ColorRole.Mid).name()};"
+                f" border-bottom:1px solid "
+                f"{_ap.color(QPalette.ColorRole.Mid).name()};")
+            self.panel_tab.setStyleSheet(self._panel_tab_qss())
+            self._side_panel.setStyleSheet(self._side_panel_qss())
+            # icons bake in a foreground color — regenerate them
+            for tool, act in self.tool_group:
+                act.setIcon(_tool_icon(tool))
+            for kind, b in self._edit_btns:
+                b.setIcon(_edit_icon(kind))
+            self._sym_btn.setIcon(_symmetry_icon())
+            self.layer_panel.refresh(self.pattern)
+
+    def _panel_tab_qss(self) -> str:
+        c = self._chrome()
+        return f"""
+            QToolButton {{ background:{c['btn'].name()};
+                          color:{c['txt'].name()};
+                          border:1px solid {c['border'].name()};
+                          border-top-right-radius:5px;
+                          border-bottom-right-radius:5px;
+                          font-size:10px; padding:0px; }}
+            QToolButton:hover {{ background:{c['hover'].name()}; }}
+            QToolButton:pressed {{ background:{c['pressed'].name()}; }}
+        """
+
+    def _side_panel_qss(self) -> str:
+        c = self._chrome()
+        return f"""
+            #SidePanel {{ background:{c['btn'].name()};
+                          border-radius:10px; font-size:11px; }}
+            #SidePanel QPushButton {{
+                background:{c['win'].name()};
+                color:{c['txt'].name()};
+                border:1px solid {c['border'].name()};
+                border-radius:6px; padding:1px 8px; font-size:11px; }}
+            #SidePanel QPushButton:hover {{
+                background:{c['hover'].name()}; }}
+            #SidePanel QPushButton:checked {{
+                background:{c['hi'].name()};
+                color:{c['htxt'].name()};
+                border-color:{c['hi'].name()}; }}
+            #SidePanel QComboBox, #SidePanel QTreeWidget,
+            #SidePanel QListWidget {{
+                background:{c['win'].name()};
+                border:1px solid {c['border'].name()};
+                border-radius:6px; padding:1px 4px; }}
+            #SidePanel QTreeWidget::item, #SidePanel QListWidget::item {{
+                padding:1px 3px; border-radius:4px; }}
+            #SidePanel QLabel {{ color:{c['txt'].name()}; }}
+        """
+
+    def _chrome(self):
+        """Theme-aware chrome colors (window/button shades + text)."""
+        # app palette, not widget palette — some styles freeze widget
+        # palettes and would ignore a theme switch
+        pal = QApplication.palette()
+        win = pal.color(QPalette.ColorRole.Window)
+        txt = pal.color(QPalette.ColorRole.ButtonText)
+        hi = pal.color(QPalette.ColorRole.Highlight)
+        htxt = pal.color(QPalette.ColorRole.HighlightedText)
+        lum = (0.299 * win.red() + 0.587 * win.green()
+               + 0.114 * win.blue())
+        if lum < 140:      # dark theme -> light buttons
+            btn = win.lighter(150)
+            hover = win.lighter(180)
+            pressed = win.lighter(165)
+            border = win.lighter(200)
+        else:              # light theme -> darker buttons
+            btn = win.darker(106)
+            hover = win.lighter(102)
+            pressed = win.darker(112)
+            border = win.darker(118)
+        return {"win": win, "btn": btn, "hover": hover,
+                "pressed": pressed, "border": border,
+                "txt": txt, "hi": hi, "htxt": htxt}
+
+    def _bar_qss(self, name: str, edge: str) -> str:
+        """Toolbar chrome styled from the app palette (dark/light safe)."""
+        c = self._chrome()
+        win, btn = c["win"], c["btn"]
+        border, txt = c["border"], c["txt"]
+        hover, pressed = c["hover"], c["pressed"]
+        hi, htxt = c["hi"], c["htxt"]
+        edge_css = (f"border-{edge}: 1px solid {border.name()};"
+                    if edge else "")
+        return f"""
+            QToolBar#{name} {{ background: {win.name()}; {edge_css}
+                               spacing: 2px; padding: 5px 7px; }}
+            QToolBar#{name}::separator {{ background: {border.name()};
+                                          width: 1px; height: 1px;
+                                          margin: 4px 3px; }}
+            QToolBar#{name} QToolButton {{
+                background: {btn.name()};
+                color: {txt.name()};
+                border: 1px solid {border.name()};
+                border-radius: 7px;
+                padding: 1px 7px; margin: 2px;
+                font-size: 11px; }}
+            QToolBar#{name} QToolButton:hover {{
+                background: {hover.name()}; }}
+            QToolBar#{name} QToolButton:pressed {{
+                background: {pressed.name()}; }}
+            QToolBar#{name} QToolButton:checked {{
+                background: {hi.name()};
+                color: {htxt.name()};
+                border-color: {hi.name()}; }}
+        """
+
+    # -- right panel collapse tab --------------------------------------
+    def _toggle_right_panel(self):
+        dock = self.right_dock
+        if dock.isVisible():
+            self._dock_w = dock.width()
+            dock.hide()
+        else:
+            dock.show()
+            if self._dock_w:
+                dock.resize(self._dock_w, dock.height())
+        self._position_panel_tab()
+
+    def _position_panel_tab(self):
+        """Pin the collapse tab to the panel's left edge (or the window's
+        right edge when the panel is hidden), vertically centered."""
+        tab = self.panel_tab
+        if self.right_dock.isVisible():
+            x = self.right_dock.geometry().left()
+        else:
+            # park just left of the canvas scrollbar
+            right_edge = self._central.mapTo(
+                self, QPoint(self._central.width(), 0)).x()
+            sb = self.canvas.verticalScrollBar()
+            sb_w = sb.width() if sb.isVisible() else 0
+            x = right_edge - sb_w - tab.width() - 2
+        top = self._central.mapTo(self, QPoint(0, 0)).y()
+        y = top + max(0, (self._central.height() - tab.height()) // 2)
+        tab.move(x, y)
+        tab.raise_()
+        tab.setText("❯" if self.right_dock.isVisible() else "❮")
+
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "_central", None) \
+                and event.type() == QEvent.Type.Resize:
+            self._position_panel_tab()
+        return super().eventFilter(obj, event)
 
     def _refresh_rulers(self, *_):
         self.h_ruler.update()
@@ -299,6 +604,20 @@ class MainWindow(QMainWindow):
         self._act(m, "&Reset Zoom", self.canvas.resetTransform, "Ctrl+0")
         self._act(m, "Actual &Size", self.canvas.zoom_actual_size)
         m.addSeparator()
+        # theme preference
+        tm = m.addMenu("&Theme")
+        self._theme_acts = {}
+        for mode, label in [("system", "System"), ("light", "Light"),
+                            ("dark", "Dark")]:
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setChecked(
+                self._settings.value("ui/theme", "system") == mode)
+            act.triggered.connect(
+                lambda _=False, md=mode: self._set_theme(md))
+            tm.addAction(act)
+            self._theme_acts[mode] = act
+        m.addSeparator()
         self.guides_act = QAction("Show &guides", self)
         self.guides_act.setCheckable(True)
         self.guides_act.setChecked(True)
@@ -345,6 +664,7 @@ class MainWindow(QMainWindow):
 
         # Help
         m = mb.addMenu("&Help")
+        self._act(m, "&User Guide", self.user_guide)
         self._act(m, "&About", self.about)
 
     def _act(self, menu, text, fn, shortcut=None):
@@ -656,9 +976,14 @@ class MainWindow(QMainWindow):
             f"{self.pattern.width}×{self.pattern.height} (even counts)")
 
     def canvas_setup(self):
-        dlg = CanvasSetupDialog(self.pattern, self)
+        dlg = CanvasSetupDialog(
+            self.pattern, self, line_width=self.canvas.line_width)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._apply_canvas_values(dlg.values())
+            v = dlg.values()
+            self.canvas.line_width = v["line_width"]
+            self._settings.setValue("canvas/line_width",
+                                    v["line_width"])
             self._save_canvas_settings()
 
     def _on_color_changed(self, spec):
@@ -1192,7 +1517,8 @@ class MainWindow(QMainWindow):
         # the user confirm/adjust before it replaces the current doc
         trial = Pattern()
         self._load_canvas_defaults(trial)
-        dlg = CanvasSetupDialog(trial, self)
+        dlg = CanvasSetupDialog(
+            trial, self, line_width=self.canvas.line_width)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         self.pattern = trial
@@ -1439,6 +1765,10 @@ class MainWindow(QMainWindow):
             return
         event.accept()
 
+    def user_guide(self):
+        from .gui.help_dialog import HelpDialog
+        HelpDialog(self).exec()
+
     def about(self):
         QMessageBox.about(self, "About Black-Werx",
                           "Black-Werx — blackwork embroidery pattern editor\n"
@@ -1498,7 +1828,7 @@ class CanvasSetupDialog(QDialog):
 
     AIDA_COUNTS = [11, 14, 16, 18, 22, 25, 28, 32, 36, 40]
 
-    def __init__(self, pattern, parent=None):
+    def __init__(self, pattern, parent=None, line_width=1):
         super().__init__(parent)
         self.setWindowTitle("Canvas setup")
         form = QFormLayout(self)
@@ -1524,6 +1854,13 @@ class CanvasSetupDialog(QDialog):
         self.h_spin.setSuffix(" mm")
         self.h_spin.setValue(pattern.stitch_h_mm)
         form.addRow("Stitch height:", self.h_spin)
+
+        self.line_w = QSpinBox()
+        self.line_w.setRange(1, 12)
+        self.line_w.setValue(line_width)
+        self.line_w.setToolTip(
+            "Thickness of X Line stitches, in cells")
+        form.addRow("X Line thickness:", self.line_w)
 
         # canvas size — stitches or inches (inches uses aida count)
         size_row = QHBoxLayout()
@@ -1617,7 +1954,8 @@ class CanvasSetupDialog(QDialog):
                 "size_mode": "inches" if self.size_mode.currentText()
                              == "Inches" else "stitches",
                 "size_w": self.size_w.value(),
-                "size_h": self.size_h.value()}
+                "size_h": self.size_h.value(),
+                "line_width": self.line_w.value()}
 
 
 def QColorDialog_getColor(parent):
@@ -1626,9 +1964,396 @@ def QColorDialog_getColor(parent):
     return (c, c.isValid())
 
 
+def _icon_ink() -> QColor:
+    """Icon foreground that contrasts with the themed button face."""
+    win = QApplication.palette().color(QPalette.ColorRole.Window)
+    lum = (0.299 * win.red() + 0.587 * win.green()
+           + 0.114 * win.blue())
+    # mirror _bar_qss: dark theme -> light buttons, light -> dark buttons
+    btn = win.lighter(150) if lum < 140 else win.darker(106)
+    blum = (0.299 * btn.red() + 0.587 * btn.green()
+            + 0.114 * btn.blue())
+    return QColor("#1c1c1c") if blum > 140 else QColor("#f2f2f2")
+
+
+def _tool_icon(tool) -> QIcon:
+    """Draw a 32px toolbar icon for a canvas tool."""
+    size = 32
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    c = size / 2
+    ink = _icon_ink()
+    blue = QColor("#2266ff")
+    red = QColor("#d33")
+    amber = QColor("#cc7700")
+
+    def cell_x(x0=7, y0=7, x1=25, y1=25):
+        grid = QPen(QColor("#bbbbbb"), 1)
+        p.setPen(grid)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(x0, y0, x1 - x0, y1 - y0)
+        xp = QPen(ink, 2.4)
+        xp.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(xp)
+        p.drawLine(x0 + 2, y0 + 2, x1 - 2, y1 - 2)
+        p.drawLine(x1 - 2, y0 + 2, x0 + 2, y1 - 2)
+
+    if tool is Tool.PENCIL:
+        cell_x()
+    elif tool is Tool.XLINE:
+        cell_x(4, 4, 15, 15)
+        dp = QPen(ink, 1.8, Qt.PenStyle.DashLine)
+        dp.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(dp)
+        p.drawLine(13, 13, 27, 27)
+    elif tool is Tool.BACKSTITCH:
+        ln = QPen(ink, 2.2)
+        ln.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(ln)
+        p.drawLine(6, c, 26, c)
+        p.setBrush(QBrush(ink))
+        p.setPen(Qt.PenStyle.NoPen)
+        for dx in (-8, 0, 8):
+            p.drawEllipse(int(c + dx - 2.5), int(c - 2.5), 5, 5)
+    elif tool is Tool.ERASER:
+        ep = QPen(red, 3)
+        ep.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(ep)
+        p.drawLine(9, 9, 23, 23)
+        p.drawLine(23, 9, 9, 23)
+    elif tool is Tool.SELECT:
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(ink))
+        p.drawPolygon(QPolygonF([
+            QPointF(9, 4), QPointF(9, 21), QPointF(13, 17),
+            QPointF(15.5, 25), QPointF(18.5, 23.5), QPointF(16, 16),
+            QPointF(21, 16)]))
+    elif tool is Tool.MOVE:
+        mp = QPen(ink, 2.4)
+        mp.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(mp)
+        p.drawLine(6, c, 26, c)
+        p.drawLine(c, 6, c, 26)
+        for ang in (0, 90, 180, 270):
+            import math
+            a = math.radians(ang)
+            tipx = c + 10 * math.cos(a)
+            tipy = c + 10 * math.sin(a)
+            bx = c + 5 * math.cos(a)
+            by = c + 5 * math.sin(a)
+            px, py = -math.sin(a), math.cos(a)
+            p.drawLine(QPointF(tipx, tipy),
+                       QPointF(bx + 3.5 * px, by + 3.5 * py))
+            p.drawLine(QPointF(tipx, tipy),
+                       QPointF(bx - 3.5 * px, by - 3.5 * py))
+    elif tool is Tool.ROTATE:
+        import math
+        r = 10.0
+        pts = [QPointF(c + r * math.cos(math.radians(a)),
+                       c + r * math.sin(math.radians(a)))
+               for a in range(80, 391, 8)]
+        rp = QPen(amber, 2.6)
+        rp.setCapStyle(Qt.PenCapStyle.RoundCap)
+        rp.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(rp)
+        p.drawPolyline(pts)
+
+        def arc_pt(deg):
+            a = math.radians(deg)
+            return QPointF(c + r * math.cos(a), c + r * math.sin(a))
+        tip = arc_pt(30)
+        p.drawLine(tip, arc_pt(8))
+        p.drawLine(tip, arc_pt(-12))
+        p.setBrush(QBrush(amber))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(int(c - 2), int(c - 2), 4, 4)
+    elif tool is Tool.BLOCK:
+        bp = QPen(blue, 1.6, Qt.PenStyle.DashLine)
+        p.setPen(bp)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(5, 5, 22, 22)
+        p.setBrush(QBrush(blue))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRect(int(c - 4), int(c - 4), 8, 8)
+    elif tool is Tool.PAN:
+        # open hand: palm + fingers
+        hp = QPen(ink, 2)
+        hp.setCapStyle(Qt.PenCapStyle.RoundCap)
+        hp.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(hp)
+        p.setBrush(QBrush(ink))
+        p.drawRoundedRect(10, 14, 12, 13, 3, 3)
+        p.setPen(Qt.PenStyle.NoPen)
+        for fx in (11.5, 15.5, 19.5):
+            p.drawRoundedRect(int(fx), 7, 3, 9, 1.5, 1.5)
+        p.drawRoundedRect(9, 13, 4, 8, 2, 2)   # thumb
+    p.end()
+    return QIcon(pm)
+
+
+def _edit_icon(kind: str) -> QIcon:
+    """Draw a 32px icon for an edit-bar command."""
+    size = 32
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    c = size / 2
+    ink = _icon_ink()
+    blue = QColor("#2266ff")
+    gray = QColor("#888888")
+
+    def magnifier():
+        mg = QPen(ink, 2.2)
+        mg.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(mg)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(5, 5, 14, 14)
+        p.drawLine(16, 16, 25, 25)
+
+    if kind in ("zoomin", "zoomout"):
+        magnifier()
+        zp = QPen(ink, 2.4)
+        zp.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(zp)
+        p.drawLine(9, 12, 15, 12)
+        if kind == "zoomin":
+            p.drawLine(12, 9, 12, 15)
+    elif kind == "actual":
+        # ruler: blade with ticks
+        rp = QPen(ink, 1.8)
+        rp.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(rp)
+        p.setBrush(QBrush(QColor("#f0f0f0")))
+        p.drawRoundedRect(4, 12, 24, 9, 2, 2)
+        for x in range(7, 25, 4):
+            p.drawLine(x, 12, x, 16)
+    elif kind == "newblock":
+        bp = QPen(blue, 1.8, Qt.PenStyle.DashLine)
+        p.setPen(bp)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(6, 6, 20, 20)
+        pp = QPen(blue, 2.4)
+        pp.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pp)
+        p.drawLine(16, 10, 16, 22)
+        p.drawLine(10, 16, 22, 16)
+    elif kind == "explode_flat":
+        # block outline breaking into loose stitches
+        ep = QPen(gray, 1.6, Qt.PenStyle.DashLine)
+        p.setPen(ep)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(5, 5, 22, 22)
+        xp = QPen(ink, 2)
+        xp.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(xp)
+        for x0, y0 in ((4, 4), (24, 5), (5, 25), (25, 24)):
+            p.drawLine(x0 - 2, y0 - 2, x0 + 2, y0 + 2)
+            p.drawLine(x0 - 2, y0 + 2, x0 + 2, y0 - 2)
+    elif kind == "explode_unlink":
+        # two interlocking squares pulled apart
+        lp = QPen(ink, 2)
+        lp.setCapStyle(Qt.PenCapStyle.RoundCap)
+        lp.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(lp)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(4, 9, 11, 11, 2, 2)
+        p.drawRoundedRect(17, 12, 11, 11, 2, 2)
+    elif kind == "dup":
+        dp = QPen(ink, 2)
+        dp.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(dp)
+        p.setBrush(QBrush(QColor("#e8e8e8")))
+        p.drawRoundedRect(5, 9, 16, 16, 2, 2)
+        p.setBrush(QBrush(blue))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(11, 5, 16, 16, 2, 2)
+    elif kind in ("rot", "flipx", "flipy"):
+        if kind == "rot":
+            import math
+            r = 10.0
+            pts = [QPointF(c + r * math.cos(math.radians(a)),
+                           c + r * math.sin(math.radians(a)))
+                   for a in range(80, 391, 8)]
+            rp = QPen(ink, 2.6)
+            rp.setCapStyle(Qt.PenCapStyle.RoundCap)
+            rp.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(rp)
+            p.drawPolyline(pts)
+
+            def arc_pt(deg):
+                a = math.radians(deg)
+                return QPointF(c + r * math.cos(a), c + r * math.sin(a))
+            tip = arc_pt(30)
+            p.drawLine(tip, arc_pt(8))
+            p.drawLine(tip, arc_pt(-12))
+        else:
+            # double-headed arrow: horizontal or vertical
+            ap = QPen(ink, 2.4)
+            ap.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(ap)
+            if kind == "flipx":
+                p.drawLine(9, c, 23, c)
+                p.drawLine(9, c, 15, c - 5)
+                p.drawLine(9, c, 15, c + 5)
+                p.drawLine(23, c, 17, c - 5)
+                p.drawLine(23, c, 17, c + 5)
+            else:
+                p.drawLine(c, 9, c, 23)
+                p.drawLine(c, 9, c - 5, 15)
+                p.drawLine(c, 9, c + 5, 15)
+                p.drawLine(c, 23, c - 5, 17)
+                p.drawLine(c, 23, c + 5, 17)
+    elif kind == "array":
+        # 3x3 grid of squares = block array
+        ap = QPen(blue, 1.6)
+        ap.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(ap)
+        p.setBrush(QBrush(QColor("#d4e4ff")))
+        for r in range(3):
+            for col in range(3):
+                p.drawRect(5 + col * 8, 5 + r * 8, 6, 6)
+    elif kind == "split":
+        # stitched line with a gap in the middle = split in half
+        sp = QPen(ink, 2.2)
+        sp.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(sp)
+        p.drawLine(5, c, 12, c)
+        p.drawLine(20, c, 27, c)
+        p.setBrush(QBrush(ink))
+        p.setPen(Qt.PenStyle.NoPen)
+        for dx in (5, 27):
+            p.drawEllipse(int(dx - 2), int(c - 2), 4, 4)
+    elif kind == "hide":
+        # eye with a slash = hide behind
+        ep = QPen(ink, 2)
+        ep.setCapStyle(Qt.PenCapStyle.RoundCap)
+        ep.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(ep)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(7, 10, 18, 12)
+        p.drawEllipse(int(c - 3), int(c - 3), 6, 6)
+        p.drawLine(5, 5, 27, 27)
+    p.end()
+    return QIcon(pm)
+
+
+def _symmetry_icon() -> QIcon:
+    """Mirror-pair arrows around a dashed axis = symmetry."""
+    size = 32
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    c = size / 2
+    blue = QColor("#2266ff")
+    # dashed vertical axis
+    ax = QPen(QColor("#999999"), 1.4, Qt.PenStyle.DashLine)
+    p.setPen(ax)
+    p.drawLine(int(c), 5, int(c), 27)
+    # two arrows facing each other across the axis
+    ap = QPen(blue, 2.4)
+    ap.setCapStyle(Qt.PenCapStyle.RoundCap)
+    ap.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(ap)
+    for y, d in ((11, 1), (21, -1)):
+        # shaft
+        p.drawLine(int(c - 9 * d), y, int(c - 3 * d), y)
+        # head: two wings back from the tip at the axis
+        tipx, tipy = c - 2 * d, y
+        for s in (-1, 1):
+            p.drawLine(QPointF(tipx, tipy),
+                       QPointF(tipx + 5 * d, tipy + s * 4))
+    p.end()
+    return QIcon(pm)
+
+
+def _asset(name: str):
+    """Path to a repo asset (Images/), or None when not present."""
+    here = Path(__file__).resolve()
+    candidates = [
+        here.parents[2] / "Images",          # source checkout
+        here.parents[1] / "Images",          # PyInstaller _internal/
+        Path(sys.executable).resolve().parent / "Images",
+    ]
+    for d in candidates:
+        p = d / name
+        if p.exists():
+            return p
+    return None
+
+
+def _splash_pixmap():
+    """Splash image with version/author overlaid at the bottom."""
+    from . import __version__, __author__
+    src = _asset("blackwerx-splash.png")
+    if src is None:
+        return None
+    base = QPixmap(str(src))
+    if base.isNull():
+        return None
+    pm = QPixmap(base.size())
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.drawPixmap(0, 0, base)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    f = p.font()
+    f.setPointSize(20)
+    f.setBold(True)
+    p.setFont(f)
+    # the splash artwork has a rounded info panel at
+    # (120, 540, 1040, 110) — center the text inside it
+    panel = QRect(120, 540, 1040, 110)
+    text = f"v{__version__}  ·  {__author__}"
+    p.setPen(QColor(0, 0, 0, 140))
+    p.drawText(panel.translated(0, 1), Qt.AlignmentFlag.AlignCenter, text)
+    p.setPen(QColor("#ffffff"))
+    p.drawText(panel, Qt.AlignmentFlag.AlignCenter, text)
+    p.end()
+    return pm
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Black-Werx")
+
+    # PNG first: some WMs/taskbars don't rasterize SVG window icons
+    icon_src = (_asset("blackwerx-icon-1024.png")
+                or _asset("blackwerx-icon.svg")
+                or _asset("blackwerx-icon.ico"))
+    if icon_src is not None:
+        app.setWindowIcon(QIcon(str(icon_src)))
+
+    splash = None
+    spm = _splash_pixmap()
+    if spm is not None:
+        # half size, then keep it within ~80% of the available screen
+        spm = spm.scaled(spm.width() // 2, spm.height() // 2,
+                         Qt.AspectRatioMode.IgnoreAspectRatio,
+                         Qt.TransformationMode.SmoothTransformation)
+        scr = app.primaryScreen()
+        if scr is not None:
+            avail = scr.availableGeometry().size()
+            mw, mh = int(avail.width() * 0.8), int(avail.height() * 0.8)
+            if spm.width() > mw or spm.height() > mh:
+                spm = spm.scaled(
+                    mw, mh, Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation)
+        splash = QSplashScreen(spm)
+        splash.show()
+        app.processEvents()
+
     win = MainWindow()
-    win.show()
+    if not app.windowIcon().isNull():
+        win.setWindowIcon(app.windowIcon())
+    if splash is not None:
+        # keep the splash on top for its ~3s, then reveal the window
+        def _reveal():
+            splash.finish(win)
+            win.show()
+        QTimer.singleShot(3000, _reveal)
+    else:
+        win.show()
     sys.exit(app.exec())

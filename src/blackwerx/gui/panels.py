@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Signal, Qt
-from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPixmap, QPalette
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QListWidget,
                                QListWidgetItem, QPushButton, QLabel,
                                QHBoxLayout, QColorDialog, QComboBox,
                                QGroupBox, QInputDialog, QScrollArea,
                                QFrame, QCheckBox, QTreeWidget,
                                QTreeWidgetItem, QDialog,
-                               QDialogButtonBox)
+                               QDialogButtonBox, QApplication)
 
 from ..core import palette
 from ..core.block import Block, BlockInstance
@@ -34,7 +34,7 @@ class ColorPanel(QWidget):
         layout = QVBoxLayout(self)
 
         self.preview = QLabel()
-        self.preview.setFixedSize(40, 40)
+        self.preview.setFixedSize(30, 30)
         self.preview.setFrameShape(QLabel.Shape.Box)
         layout.addWidget(self.preview, alignment=Qt.AlignmentFlag.AlignCenter)
 
@@ -413,7 +413,9 @@ class LayerPanel(QWidget):
         h.addWidget(self.guides_lock_btn)
 
         name = QLabel("Guides (non-printing)")
-        name.setStyleSheet("color:#777; font-style:italic;")
+        _mid = QApplication.palette().color(
+            QPalette.ColorRole.Mid).name()
+        name.setStyleSheet(f"font-style:italic; color:{_mid};")
         h.addWidget(name, 1)
         return row
 
@@ -444,11 +446,31 @@ class LayerPanel(QWidget):
         row = _LayerRow()
         active = p.active_layer == layer["id"]
         total = len(p.layers)
-        row.setStyleSheet(
-            "QFrame { background:#eef3ff; border:1px solid #b9c8ee;"
-            " border-radius:4px; }" if active else
-            "QFrame { background:#f7f7f7; border:1px solid #ddd;"
-            " border-radius:4px; }")
+        # app palette — widget palettes can be frozen by the style
+        pal = QApplication.palette()
+        win = pal.color(QPalette.ColorRole.Window)
+        hi = pal.color(QPalette.ColorRole.Highlight)
+        lum = (0.299 * win.red() + 0.587 * win.green()
+               + 0.114 * win.blue())
+        dark = lum < 140
+        if dark:
+            inact_bg = win.lighter(112)
+            inact_bd = win.lighter(160)
+        else:
+            inact_bg = win.darker(102)
+            inact_bd = win.darker(115)
+        if active:
+            act_bg = QColor(hi)
+            act_bg.setAlpha(90)
+            row.setStyleSheet(
+                "QFrame { background:"
+                f"{act_bg.name(QColor.NameFormat.HexArgb)};"
+                f" border:1px solid {hi.name()}; border-radius:4px; }}")
+        else:
+            row.setStyleSheet(
+                "QFrame { background:"
+                f"{inact_bg.name()}; border:1px solid "
+                f"{inact_bd.name()}; border-radius:4px; }}")
         h = QHBoxLayout(row)
         h.setContentsMargins(4, 2, 4, 2)
         h.setSpacing(4)
@@ -499,7 +521,6 @@ class LayerPanel(QWidget):
         h.addWidget(cbtn)
 
         name = _LayerNameLabel(layer["name"])
-        name.setStyleSheet("color:#1c2430; font-weight:600;")
         name.setToolTip("Double-click to rename; click row to activate")
         name.double_clicked.connect(lambda l=layer: self._rename_layer(l))
         h.addWidget(name, 1)

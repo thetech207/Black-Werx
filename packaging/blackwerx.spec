@@ -1,11 +1,17 @@
 # PyInstaller spec for Black-Werx (onedir)
 # Build: .venv/bin/pip install pyinstaller && .venv/bin/pyinstaller packaging/blackwerx.spec
 
+import os
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(SPEC)))
+
 a = Analysis(
-    ["src/blackwerx/__main__.py"],
-    pathex=["src"],
+    [os.path.join(ROOT, "packaging/run.py")],
+    pathex=[os.path.join(ROOT, "src")],
     binaries=[],
-    datas=[("src/blackwerx/resources", "blackwerx/resources")],
+    datas=[(os.path.join(ROOT, "src/blackwerx/resources"),
+            "blackwerx/resources"),
+           (os.path.join(ROOT, "Images"), "Images")],
     hiddenimports=["blackwerx.core.exporters.chart"],
     hookspath=[],
     runtime_hooks=[],

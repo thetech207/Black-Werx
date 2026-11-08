@@ -32,7 +32,7 @@ class Ruler(QWidget):
         self._dragging = False
         self.setAutoFillBackground(True)
         pal = self.palette()
-        pal.setColor(self.backgroundRole(), QColor("#ececec"))
+        pal.setColor(self.backgroundRole(), QColor("#f3eee1"))
         self.setPalette(pal)
         if orientation is Qt.Orientation.Horizontal:
             self.setFixedHeight(22)
@@ -60,7 +60,7 @@ class Ruler(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         w, h = self.width(), self.height()
-        p.fillRect(0, 0, w, h, QColor("#ececec"))
+        p.fillRect(0, 0, w, h, QColor("#f3eee1"))
         p.setFont(QFont("Sans", 7))
 
         lo, hi = self._visible_cell_range()
