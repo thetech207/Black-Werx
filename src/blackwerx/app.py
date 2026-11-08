@@ -2318,6 +2318,9 @@ def _splash_pixmap():
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Black-Werx")
+    # match the installed blackwerx.desktop so the dock/taskbar groups
+    # the running window under the launcher icon
+    app.setDesktopFileName("blackwerx")
 
     # PNG first: some WMs/taskbars don't rasterize SVG window icons
     icon_src = (_asset("blackwerx-icon-1024.png")

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "blackwerx"
-version = "1.0.0"
+version = "1.0.1"
 description = "Blackwork embroidery pattern editor"
 authors = [{name = "thetech207"}]
 requires-python = ">=3.10"

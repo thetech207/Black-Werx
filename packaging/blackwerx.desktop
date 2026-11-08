@@ -6,3 +6,4 @@ Exec=blackwerx
 Icon=blackwerx
 Categories=Graphics;Office;
 Terminal=false
+StartupWMClass=blackwerx
