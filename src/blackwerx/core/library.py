@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 
 from .block import Block
 
-GLOBAL_LIBRARY_PATH = (
-    Path.home() / ".local" / "share" / "blackwerx" / "library.json"
-)
+if sys.platform == "win32":
+    GLOBAL_LIBRARY_PATH = (
+        Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+        / "blackwerx" / "library.json"
+    )
+else:
+    GLOBAL_LIBRARY_PATH = (
+        Path.home() / ".local" / "share" / "blackwerx" / "library.json"
+    )
 
 
 class Library:

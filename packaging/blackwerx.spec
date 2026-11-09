@@ -26,6 +26,7 @@ exe = EXE(
     exclude_binaries=True,
     name="blackwerx",
     console=False,
+    icon=os.path.join(ROOT, "Images", "blackwerx-icon.ico"),
 )
 coll = COLLECT(
     exe,

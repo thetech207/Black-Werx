@@ -39,7 +39,8 @@ python3 -m venv .venv
 `.bwpx` files are versioned JSON (`{"format": "bwpx", "version": 1, ...}`).
 
 The global block library lives at
-`~/.local/share/blackwerx/library.json` (XDG path).
+`~/.local/share/blackwerx/library.json` (XDG path) on Linux, or
+`%APPDATA%\blackwerx\library.json` on Windows.
 
 ## Layout
 

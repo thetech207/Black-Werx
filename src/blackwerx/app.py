@@ -2385,4 +2385,10 @@ def main():
         QTimer.singleShot(3000, _reveal)
     else:
         win.show()
+
+    # open a project passed on the command line (e.g. via a .bwpx
+    # file association on Windows or `blackwerx file.bwpx`)
+    if len(sys.argv) > 1 and Path(sys.argv[1]).is_file():
+        QTimer.singleShot(0, lambda: win._load_path(sys.argv[1]))
+
     sys.exit(app.exec())
