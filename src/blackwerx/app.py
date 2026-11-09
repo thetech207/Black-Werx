@@ -49,9 +49,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Black-Werx")
         self.resize(1200, 800)
         self._settings = QSettings("BlackWerx", "BlackWerx")
-        # capture the OS palette before any override so "System" can
-        # restore it later
+        # capture the OS palette + style before any override so
+        # "System" can restore them later
         self._system_palette = QApplication.palette()
+        self._system_style = QApplication.style().objectName()
         self._apply_palette()
 
         self.pattern = Pattern()
@@ -381,10 +382,18 @@ class MainWindow(QMainWindow):
         p.setColor(QPalette.ColorRole.Mid, QColor(text).darker(130))
         p.setColor(QPalette.ColorRole.PlaceholderText,
                    QColor(text).darker(140))
+        p.setColor(QPalette.ColorRole.ToolTipBase, QColor(win))
+        p.setColor(QPalette.ColorRole.ToolTipText, QColor(text))
         return p
 
     def _apply_palette(self):
         mode = self._settings.value("ui/theme", "system")
+        if sys.platform == "win32":
+            # the native Windows style paints menus/scrollbars from
+            # OS colors and ignores the palette, leaving light text on
+            # a light menu bar — Fusion follows the palette everywhere
+            QApplication.setStyle(
+                self._system_style if mode == "system" else "fusion")
         QApplication.setPalette(self._theme_palette(mode))
 
     def _set_theme(self, mode: str):
