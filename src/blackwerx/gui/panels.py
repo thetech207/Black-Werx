@@ -45,6 +45,9 @@ class ColorPanel(QWidget):
         layout.addWidget(self.filter_box)
 
         self.list = QListWidget()
+        # QAbstractScrollArea's default minimumSizeHint (~192px) forces
+        # the dock to overflow on short screens — let it compress
+        self.list.setMinimumHeight(56)
         self.list.itemClicked.connect(self._pick)
         layout.addWidget(self.list)
 
@@ -124,6 +127,12 @@ class LibraryPanel(QWidget):
         self.project_tree = self._make_tree()
         layout.addWidget(self.project_tree)
 
+        # action buttons live in a separate strip the main window pins
+        # below the splitter so they stay reachable on short screens
+        self.actions = QWidget()
+        alay = QVBoxLayout(self.actions)
+        alay.setContentsMargins(0, 0, 0, 0)
+        alay.setSpacing(4)
         btn_row = QHBoxLayout()
         for text, sig in [
             ("Place", self._place_selected),
@@ -133,7 +142,7 @@ class LibraryPanel(QWidget):
             b = QPushButton(text)
             b.clicked.connect(sig)
             btn_row.addWidget(b)
-        layout.addLayout(btn_row)
+        alay.addLayout(btn_row)
         btn_row2 = QHBoxLayout()
         for text, sig in [
             ("Delete", self._delete_selected),
@@ -143,12 +152,12 @@ class LibraryPanel(QWidget):
             b = QPushButton(text)
             b.clicked.connect(sig)
             btn_row2.addWidget(b)
-        layout.addLayout(btn_row2)
+        alay.addLayout(btn_row2)
 
     def _make_tree(self) -> QTreeWidget:
         tree = QTreeWidget()
         tree.setHeaderHidden(True)
-        tree.setMinimumHeight(80)
+        tree.setMinimumHeight(56)
         tree.itemDoubleClicked.connect(self._on_double_click)
         return tree
 
@@ -340,6 +349,7 @@ class LayerPanel(QWidget):
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
+        self.scroll.setMinimumHeight(56)
         self.rows_widget = QWidget()
         self.rows_layout = QVBoxLayout(self.rows_widget)
         self.rows_layout.setContentsMargins(0, 0, 0, 0)

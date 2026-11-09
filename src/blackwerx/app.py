@@ -307,6 +307,9 @@ class MainWindow(QMainWindow):
         self.right_splitter.setStretchFactor(1, 0)
         self.right_splitter.setStretchFactor(2, 1)
         rlay.addWidget(self.right_splitter)
+        # library actions pinned below the splitter so they never get
+        # pushed off-screen when the panels compress on short displays
+        rlay.addWidget(self.library_panel.actions)
         rlay.setContentsMargins(5, 5, 5, 5)
         rlay.setSpacing(4)
         rdock = QDockWidget("Palette & Library", self)
