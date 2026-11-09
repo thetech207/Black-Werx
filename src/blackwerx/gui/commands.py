@@ -247,6 +247,8 @@ class MoveStitchesCommand(QUndoCommand):
         self._inst_before: dict = {}
         self._layers = None
         self._new_keys: list = []
+        self._newkey_set: set = set()
+        self._displaced: dict = {}
 
     def _snapshot(self):
         self._before = {}
@@ -266,21 +268,41 @@ class MoveStitchesCommand(QUndoCommand):
 
     def redo(self):
         self._snapshot()
+        self._newkey_set = set()
+        self._displaced = {}
         new_keys = []
         all_uids = []
+        # collect and remove all sources across every layer BEFORE
+        # writing — a moved stitch landing on a not-yet-read source key
+        # would otherwise move twice and eat the original
+        per_layer = []
+        all_src = {}
         for keys, uids, m in self._layers:
+            src = {}
+            for k in keys:
+                s = self.pattern.stitches.get(k)
+                if s is not None:
+                    src[k] = s
+            per_layer.append((src, uids, m))
+            all_src.update(src)
+        for k in all_src:
+            self.pattern.stitches.pop(k, None)
+        for src, uids, m in per_layer:
             # conjugated delta: linear part of m applied to (dx, dy)
             ddx = m.m00 * self.dx + m.m01 * self.dy
             ddy = m.m10 * self.dx + m.m11 * self.dy
-            for k in keys:
-                s = self.pattern.stitches.get(k)
-                if s:
-                    self.pattern.stitches.pop(k)
-                    ns = replace(
-                        s, a=(s.a[0] + ddx, s.a[1] + ddy),
-                        b=((s.b[0] + ddx, s.b[1] + ddy) if s.b else None))
-                    self.pattern.stitches[ns.key] = ns
-                    new_keys.append(ns.key)
+            for k, s in src.items():
+                ns = replace(
+                    s, a=(s.a[0] + ddx, s.a[1] + ddy),
+                    b=((s.b[0] + ddx, s.b[1] + ddy) if s.b else None))
+                existing = self.pattern.stitches.get(ns.key)
+                if existing is not None \
+                        and ns.key not in self._newkey_set:
+                    # stash the displaced stitch so undo restores it
+                    self._displaced[ns.key] = existing
+                self.pattern.stitches[ns.key] = ns
+                self._newkey_set.add(ns.key)
+                new_keys.append(ns.key)
             for inst in self.pattern.instances:
                 if inst.uid in uids:
                     inst.transform = inst.transform.then(
@@ -292,6 +314,8 @@ class MoveStitchesCommand(QUndoCommand):
     def undo(self):
         for k in self._new_keys:
             self.pattern.stitches.pop(k, None)
+        for k, s in self._displaced.items():
+            self.pattern.stitches[k] = s
         for k, s in self._before.items():
             self.pattern.stitches[k] = s
         for inst in self.pattern.instances:
@@ -300,6 +324,8 @@ class MoveStitchesCommand(QUndoCommand):
         _set_selection(self.selection, self.stitch_keys,
                        self.instance_uids)
         self._new_keys = []
+        self._newkey_set = set()
+        self._displaced = {}
 
 
 def _rot_about_op(cx, cy, q):
@@ -326,6 +352,8 @@ class TransformSelectionCommand(QUndoCommand):
         self._layers = None
         self._new_keys: list = []
         self._new_uids: list = []
+        self._newkey_set: set = set()
+        self._displaced: dict = {}
 
     def redo(self):
         if self._layers is None:
@@ -340,17 +368,34 @@ class TransformSelectionCommand(QUndoCommand):
                     if inst.uid in uids:
                         self._inst_before[inst.uid] = inst.transform
         new_keys, new_uids = [], []
+        self._newkey_set = set()
+        self._displaced = {}
+        # collect and remove all sources across every layer BEFORE
+        # writing — a moved stitch landing on a not-yet-read source key
+        # would otherwise be re-read and moved twice
+        per_layer = []
+        all_src = {}
         for keys, uids, m in self._layers:
-            op = _conj(_rot_about_op(self.cx, self.cy, self.q), m)
-            moved = []
+            src = {}
             for k in keys:
                 s = self.pattern.stitches.get(k)
-                if s:
-                    moved.append(transform_stitch(s, op))
-            for k in keys:
-                self.pattern.stitches.pop(k, None)
-            for ns in moved:
+                if s is not None:
+                    src[k] = s
+            per_layer.append((src, uids, m))
+            all_src.update(src)
+        for k in all_src:
+            self.pattern.stitches.pop(k, None)
+        for src, uids, m in per_layer:
+            op = _conj(_rot_about_op(self.cx, self.cy, self.q), m)
+            for k, s in src.items():
+                ns = transform_stitch(s, op)
+                existing = self.pattern.stitches.get(ns.key)
+                if existing is not None \
+                        and ns.key not in self._newkey_set:
+                    # stash the displaced stitch so undo restores it
+                    self._displaced[ns.key] = existing
                 self.pattern.stitches[ns.key] = ns
+                self._newkey_set.add(ns.key)
                 new_keys.append(ns.key)
             for inst in self.pattern.instances:
                 if inst.uid in uids:
@@ -363,11 +408,15 @@ class TransformSelectionCommand(QUndoCommand):
     def undo(self):
         for k in self._new_keys:
             self.pattern.stitches.pop(k, None)
+        for k, s in self._displaced.items():
+            self.pattern.stitches[k] = s
         for k, s in self._before.items():
             self.pattern.stitches[k] = s
         for inst in self.pattern.instances:
             if inst.uid in self._inst_before:
                 inst.transform = self._inst_before[inst.uid]
+        self._newkey_set = set()
+        self._displaced = {}
         _set_selection(self.selection, self.stitch_keys, self.uids)
         self._new_keys, self._new_uids = [], []
 
@@ -382,7 +431,7 @@ class CopySelectionCommand(QUndoCommand):
 
     def __init__(self, pattern, stitch_keys, instance_uids, copies,
                  text="Duplicate", orig_op=None, selection=None,
-                 sym_ops=None):
+                 sym_ops=None, target_layer=None):
         super().__init__(text)
         self.pattern = pattern
         self.stitch_keys = list(stitch_keys)
@@ -393,10 +442,16 @@ class CopySelectionCommand(QUndoCommand):
         self.orig_op = orig_op
         self.selection = selection
         self.sym_ops = list(sym_ops or [])
+        # optional layer override for the copies — lets a copy sit at the
+        # same position as the original (keys differ by layer)
+        self.target_layer = target_layer
+        self.skipped = 0    # copies dropped because the cell was occupied
         self.created_stitch_keys: list = []
         self.created_uids: list = []
         self._orig_new_keys: list = []
-        self._overwritten: dict = {}
+        self._created_keys: set = set()
+        self._moved_keys: set = set()
+        self._displaced: dict = {}
         self._orig_before: dict = {}
         self._inst_before: dict = {}
         self._done = False
@@ -423,12 +478,17 @@ class CopySelectionCommand(QUndoCommand):
                     if s is None:
                         continue
                     ns = transform_stitch(s, op)
+                    if self.target_layer is not None:
+                        ns = replace(ns, layer=self.target_layer)
                     if ns.key in self.pattern.stitches \
-                            and ns.key not in self._overwritten:
-                        self._overwritten[ns.key] = \
-                            self.pattern.stitches[ns.key]
+                            and ns.key not in self._created_keys:
+                        # never clobber a stitch that was already there —
+                        # a copy must not eat whatever it overlaps
+                        self.skipped += 1
+                        continue
                     self.pattern.stitches[ns.key] = ns
                     self.created_stitch_keys.append(ns.key)
+                    self._created_keys.add(ns.key)
                 for inst in list(self.pattern.instances):
                     if inst.uid not in layer_uids:
                         continue
@@ -437,21 +497,44 @@ class CopySelectionCommand(QUndoCommand):
                         block_id=inst.block_id, scope=inst.scope,
                         transform=inst.transform.then(op),
                         linked=inst.linked, recolor=dict(inst.recolor),
-                        layer=inst.layer)
+                        layer=(self.target_layer
+                               if self.target_layer is not None
+                               else inst.layer))
                     self.pattern.instances.append(ni)
                     self.created_uids.append(ni.uid)
-            if self.orig_op is not None:
-                dx, dy, cx, cy, q = self.orig_op
-                op = _conj(self._spec_op(dx, dy, cx, cy, q), m)
+        if self.orig_op is not None:
+            dx, dy, cx, cy, q = self.orig_op
+            # snapshot every source across all layers BEFORE writing —
+            # a moved stitch landing on a not-yet-read source key would
+            # otherwise move twice and eat the original
+            per_layer = []
+            all_src = {}
+            for keys, uids, m in layers:
+                src = {}
                 for k in keys:
                     s = self.pattern.stitches.get(k)
                     if s is None:
                         continue
-                    if k not in self._orig_before:
-                        self._orig_before[k] = s
-                    self.pattern.stitches.pop(k, None)
+                    self._orig_before.setdefault(k, s)
+                    src[k] = s
+                per_layer.append((src, uids, m))
+                all_src.update(src)
+            for k in all_src:
+                self.pattern.stitches.pop(k, None)
+            for src, uids, m in per_layer:
+                op = _conj(self._spec_op(dx, dy, cx, cy, q), m)
+                layer_uids = set(uids)
+                for k, s in src.items():
                     ns = transform_stitch(s, op)
+                    existing = self.pattern.stitches.get(ns.key)
+                    if existing is not None \
+                            and ns.key not in self._created_keys \
+                            and ns.key not in self._moved_keys:
+                        # the moved stitch displaced an unrelated one —
+                        # stash it so undo can put it back
+                        self._displaced[ns.key] = existing
                     self.pattern.stitches[ns.key] = ns
+                    self._moved_keys.add(ns.key)
                     self._orig_new_keys.append(ns.key)
                 for inst in self.pattern.instances:
                     if inst.uid in layer_uids:
@@ -467,27 +550,28 @@ class CopySelectionCommand(QUndoCommand):
                        + (all_uids if self.orig_op else []))
 
     def undo(self):
-        # remove created stitches in reverse so overlapping copies restore
-        # earlier copies correctly
         for k in reversed(self.created_stitch_keys):
             self.pattern.stitches.pop(k, None)
-        for k, s in self._overwritten.items():
-            self.pattern.stitches[k] = s
         drop = set(self.created_uids)
         self.pattern.instances = [i for i in self.pattern.instances
                                   if i.uid not in drop]
         # restore transformed originals
         for k in self._orig_new_keys:
             self.pattern.stitches.pop(k, None)
+        for k, s in self._displaced.items():
+            self.pattern.stitches[k] = s
         for k, s in self._orig_before.items():
             self.pattern.stitches[k] = s
         for inst in self.pattern.instances:
             if inst.uid in self._inst_before:
                 inst.transform = self._inst_before[inst.uid]
-        self._overwritten.clear()
+        self._displaced.clear()
         self.created_stitch_keys.clear()
         self.created_uids.clear()
         self._orig_new_keys.clear()
+        self._created_keys.clear()
+        self._moved_keys.clear()
+        self.skipped = 0
         self._done = False
         _set_selection(self.selection, self.stitch_keys, self.uids)
 
@@ -517,6 +601,8 @@ class TransformInstancesCommand(QUndoCommand):
         self._layers = None
         self._new_keys: list = []
         self._new_uids: list = []
+        self._newkey_set: set = set()
+        self._displaced: dict = {}
 
     def _center_for(self, inst):
         """Integer center of the block definition's local bbox."""
@@ -543,18 +629,36 @@ class TransformInstancesCommand(QUndoCommand):
                     if s:
                         self._stitch_before[k] = s
         new_keys, new_uids = [], []
+        self._newkey_set = set()
+        self._displaced = {}
+        # collect and remove all sources across every layer BEFORE
+        # writing — a moved stitch landing on a not-yet-read source key
+        # would otherwise be re-read and moved twice
+        per_layer = []
+        all_src = {}
         for keys, uids, m in self._layers:
+            src = {}
             if self.stitch_op is not None:
-                op = _conj(self.stitch_op, m)
-                moved = []
                 for k in keys:
                     s = self.pattern.stitches.get(k)
-                    if s:
-                        moved.append(transform_stitch(s, op))
-                for k in keys:
-                    self.pattern.stitches.pop(k, None)
-                for ns in moved:
+                    if s is not None:
+                        src[k] = s
+            per_layer.append((src, uids, m))
+            all_src.update(src)
+        for k in all_src:
+            self.pattern.stitches.pop(k, None)
+        for src, uids, m in per_layer:
+            if self.stitch_op is not None:
+                op = _conj(self.stitch_op, m)
+                for k, s in src.items():
+                    ns = transform_stitch(s, op)
+                    existing = self.pattern.stitches.get(ns.key)
+                    if existing is not None \
+                            and ns.key not in self._newkey_set:
+                        # stash the displaced stitch so undo restores it
+                        self._displaced[ns.key] = existing
                     self.pattern.stitches[ns.key] = ns
+                    self._newkey_set.add(ns.key)
                     new_keys.append(ns.key)
             # local-space ops are identical on every orbit member:
             # T_i' = (M T) L = M (T L)
@@ -579,10 +683,14 @@ class TransformInstancesCommand(QUndoCommand):
                 inst.transform = self._before[inst.uid]
         for k in self._new_keys:
             self.pattern.stitches.pop(k, None)
+        for k, s in self._displaced.items():
+            self.pattern.stitches[k] = s
         for k, s in self._stitch_before.items():
             self.pattern.stitches[k] = s
         _set_selection(self.selection, self.stitch_keys, self.uids)
         self._new_keys, self._new_uids = [], []
+        self._newkey_set = set()
+        self._displaced = {}
 
 
 class RecolorCommand(QUndoCommand):
@@ -720,6 +828,8 @@ class MoveToLayerCommand(QUndoCommand):
         self._before = {}      # old stitch key -> Stitch
         self._inst_before = {} # uid -> old layer
         self._new_keys = []
+        self._newkey_set: set = set()
+        self._displaced: dict = {}
         self._all_keys: list = []
         self._all_uids: list = []
 
@@ -745,10 +855,17 @@ class MoveToLayerCommand(QUndoCommand):
         for k in src:
             self.pattern.stitches.pop(k, None)
         self._new_keys = []
+        self._newkey_set = set()
+        self._displaced = {}
         for s in src.values():
             ns = s if s.layer == self.layer_id else replace(
                 s, layer=self.layer_id)
+            existing = self.pattern.stitches.get(ns.key)
+            if existing is not None and ns.key not in self._newkey_set:
+                # stash the displaced stitch so undo restores it
+                self._displaced[ns.key] = existing
             self.pattern.stitches[ns.key] = ns
+            self._newkey_set.add(ns.key)
             self._new_keys.append(ns.key)
         for inst in self.pattern.instances:
             if inst.uid in self._all_uids:
@@ -760,6 +877,8 @@ class MoveToLayerCommand(QUndoCommand):
             s = self.pattern.stitches.get(ns_key)
             if s is not None and s.layer == self.layer_id:
                 self.pattern.stitches.pop(ns_key, None)
+        for k, s in self._displaced.items():
+            self.pattern.stitches[k] = s
         for k, s in self._before.items():
             self.pattern.stitches[k] = s
         for inst in self.pattern.instances:

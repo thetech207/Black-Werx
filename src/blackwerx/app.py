@@ -1356,16 +1356,29 @@ class MainWindow(QMainWindow):
             specs = [(k * dx, k * dy, cx, cy, (k * q) % 4)
                      for k in steps]
             orig_op = None if keep else op
-            self.undo_stack.push(CopySelectionCommand(
+            cmd = CopySelectionCommand(
                 self.pattern, keys, uids, specs,
                 text=f"{label} +{len(specs)} copies",
                 orig_op=orig_op, selection=sel,
-                sym_ops=self._sym_ops()))
+                sym_ops=self._sym_ops())
+            self.undo_stack.push(cmd)
+            if cmd.skipped:
+                self.statusBar().showMessage(
+                    f"{cmd.skipped} stitch(es) skipped — "
+                    "target cells occupied")
         self.canvas.refresh()
         self._update_status()
 
     def duplicate_selection(self):
-        """Copy selection offset by (1,1), select the copies, enter Move."""
+        """Copy the selection, select the copies, enter Move.
+
+        Stitches are keyed by position+layer, so two stitches can't share
+        a cell on one layer. A literal on-top copy is therefore only
+        possible on a different layer: when the active layer is free of
+        the selection, copies land there in place. Otherwise the copy is
+        placed just right of the selection's bounds so it can never
+        overlap and clobber the originals.
+        """
         if self.canvas.active_symmetry_axes:
             self.statusBar().showMessage(
                 "Duplicate is unavailable while symmetry is active.")
@@ -1376,15 +1389,36 @@ class MainWindow(QMainWindow):
             return
         self._record("Edit: Duplicate", self.duplicate_selection)
         keys, uids = self._sel_ids()
+        src_layers = {self.pattern.stitches[k].layer for k in keys
+                      if k in self.pattern.stitches}
+        active = self.pattern.active_layer
+        if (src_layers and active not in src_layers
+                and self.pattern.layer_visible(active)
+                and not self.pattern.layer_locked(active)):
+            # active layer is free of the selection — copy in place
+            spec, target = (0, 0, 0, 0, 0), active
+        else:
+            spec, target = (self._dup_dx(keys), 0, 0, 0, 0), None
         cmd = CopySelectionCommand(
-            self.pattern, keys, uids, [(1, 1, 0, 0, 0)], text="Duplicate",
-            selection=sel, sym_ops=self._sym_ops())
+            self.pattern, keys, uids, [spec], text="Duplicate",
+            selection=sel, sym_ops=self._sym_ops(), target_layer=target)
         self.undo_stack.push(cmd)
+        if cmd.skipped:
+            self.statusBar().showMessage(
+                f"Duplicate skipped {cmd.skipped} stitch(es) — "
+                "target cells occupied")
         # command already selected the copies; enter Move to drag them
         self.canvas.viewport().update()
         self._set_tool(Tool.MOVE)
         self.canvas.refresh()
         self._update_status()
+
+    def _dup_dx(self, keys) -> int:
+        """Horizontal offset clearing the selection's cell bounds."""
+        xs = [c[0] for k in keys
+              if (s := self.pattern.stitches.get(k)) is not None
+              for c in s.cells()]
+        return (max(xs) - min(xs) + 2) if xs else 1
 
     def recolor_selection(self):
         sel = self.canvas.selection
