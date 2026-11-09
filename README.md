@@ -61,6 +61,15 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest tests/ -q
 
 ## Packaging (Debian)
 
-See `packaging/` — a `.desktop` file and PyInstaller spec are provided.
-PySide6 pulls in Qt6; on Debian install `libgl1` and `libegl1` if the
-binary complains about OpenGL.
+See `packaging/` — a `.desktop` file and PyInstaller spec are provided;
+`build-deb.sh` wraps the PyInstaller bundle into a `.deb`. PySide6 pulls
+in Qt6; on Debian install `libgl1` and `libegl1` if the binary complains
+about OpenGL.
+
+## Packaging (Windows)
+
+`packaging/build-windows.ps1` builds the PyInstaller bundle plus an Inno
+Setup installer (per-user install, `.bwpx` file association). CI
+(`.github/workflows/build.yml`) runs tests and builds both the Windows
+installer and the `.deb` on every push, and attaches them to published
+releases automatically.
